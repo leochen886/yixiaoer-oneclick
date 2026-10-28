@@ -1,0 +1,8 @@
+{
+  "createType": 1,
+  "declaration": 0,
+  "publishChannel": "local",
+  "fallbackTags": [],
+  "keepRuns": 20,
+  "waitSeconds": 900
+}

@@ -1,0 +1,32 @@
+# 视频 / 音频 / 图片等媒体大文件
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.wav
+*.mp3
+*.m4a
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# 转写模型与本地视频工程
+koubo/
+
+# 发布运行记录与历史产物
+publish-runs/
+publish-test/
+publish-20261022/
+sph-1028/
+_work_1019/
+
+# 含账号 ID / OSS key 的 payload 与表单
+payload-*.json
+publish-form-*.json
+
+# 本地调试与缓存
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
