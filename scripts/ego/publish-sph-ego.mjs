@@ -236,12 +236,14 @@ async function main() {
       console.log("RESULT=FAIL 视频上传超时或失败");
       return;
     }
-    await page.waitForTimeout(2000);
-
     // 5) 短标题（上限 16 字，兜底截断）
+    // “取消上传”消失只代表字节传完，不代表表单已渲染；大视频转码/出封面更慢，
+    // 固定 sleep 猜时长会在这步超时。改成按真实条件等待：短标题输入框可见后再填。
+    const TITLE_SELECTOR = 'input[placeholder="填写短标题有机会获得更多流量"]';
     const title = (input.title || "").trim().slice(0, 16);
     if (title) {
-      await page.fill('input[placeholder="填写短标题有机会获得更多流量"]', title);
+      await page.waitForSelector(TITLE_SELECTOR, { state: "visible", timeout: 900000 });
+      await page.fill(TITLE_SELECTOR, title);
       console.log("TITLE_FILLED");
     }
 
@@ -250,6 +252,7 @@ async function main() {
     const tags = (input.tags || []).map((t) => "#" + String(t).replace(/^#/, "")).join(" ");
     const fullDesc = [desc, tags].filter(Boolean).join(" ").trim();
     if (fullDesc) {
+      await page.waitForSelector(".input-editor[contenteditable]", { state: "visible", timeout: 900000 });
       await page.focus(".input-editor[contenteditable]");
       await page.keyboard.insertText(fullDesc);
       console.log("DESC_FILLED");
