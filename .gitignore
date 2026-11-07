@@ -30,3 +30,6 @@ publish-form-*.json
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# ego 运行时输入文件（每次发布/复盘临时生成）
+scripts/ego/*-input.json

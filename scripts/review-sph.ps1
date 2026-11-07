@@ -23,8 +23,10 @@ $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $ScriptDir = $PSScriptRoot
 $Root = Split-Path -Parent $ScriptDir
 $RunRoot = Join-Path $Root 'publish-runs'
-$CollectInputPath = 'C:\Users\CL\ego\collect-sph-post-input.json'
-$CollectScriptUrl = 'file:///C:/Users/CL/ego/collect-sph-post.mjs'
+$EgoDir = Join-Path $ScriptDir 'ego'
+$CollectInputPath = Join-Path $EgoDir 'collect-sph-post-input.json'
+$CollectScriptPath = Join-Path $EgoDir 'collect-sph-post.mjs'
+$CollectScriptUrl = 'file:///' + ($CollectScriptPath -replace '\\', '/')
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-JsonFile {

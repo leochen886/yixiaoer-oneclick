@@ -34,10 +34,13 @@ $ConfigPath = Join-Path $Root 'oneclick-config.json'
 $RunRoot = Join-Path $Root 'publish-runs'
 $AsrScript = Join-Path $ScriptDir 'oneclick_asr.py'
 
-# ego 相关固定路径（ASCII，避免中文进命令行参数）
-$EgoInputPath = 'C:\Users\CL\ego\publish-sph-ego-input.json'
-$EgoScriptUrl = 'file:///C:/Users/CL/ego/publish-sph-ego.mjs'
-$LoginGateUrl = 'file:///C:/Users/CL/ego/login-gate.mjs'
+# ego 相关路径（脚本源码已纳入 scripts\ego\ 版本控制，相对脚本目录解析）
+$EgoDir = Join-Path $ScriptDir 'ego'
+$EgoInputPath = Join-Path $EgoDir 'publish-sph-ego-input.json'
+$EgoScriptPath = Join-Path $EgoDir 'publish-sph-ego.mjs'
+$LoginGatePath = Join-Path $EgoDir 'login-gate.mjs'
+$EgoScriptUrl = 'file:///' + ($EgoScriptPath -replace '\\', '/')
+$LoginGateUrl = 'file:///' + ($LoginGatePath -replace '\\', '/')
 
 $script:LogFile = $null
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -374,8 +377,8 @@ try {
     if (-not (Get-Command 'ego-browser' -ErrorAction SilentlyContinue)) {
         throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
     }
-    if (-not (Test-Path -LiteralPath 'C:\Users\CL\ego\login-gate.mjs')) {
-        throw '缺少登录门禁脚本：C:\Users\CL\ego\login-gate.mjs'
+    if (-not (Test-Path -LiteralPath $LoginGatePath)) {
+        throw ('缺少登录门禁脚本：' + $LoginGatePath)
     }
     Write-Log '正在检测视频号登录态……' Cyan
     $loginResult = Invoke-Ego -TimeoutMs 360000 -ScriptUrl $LoginGateUrl
@@ -415,7 +418,7 @@ try {
         }
     }
     if (-not (Test-Path -LiteralPath $AsrScript)) { throw ("缺少转写脚本：{0}" -f $AsrScript) }
-    if (-not (Test-Path -LiteralPath 'C:\Users\CL\ego\publish-sph-ego.mjs')) { throw '缺少 ego 自动化脚本：C:\Users\CL\ego\publish-sph-ego.mjs' }
+    if (-not (Test-Path -LiteralPath $EgoScriptPath)) { throw ('缺少 ego 自动化脚本：' + $EgoScriptPath) }
 
     # ---- 2. 运行目录 ------------------------------------------------
     $videoBase = [System.IO.Path]::GetFileNameWithoutExtension($videoPath)
