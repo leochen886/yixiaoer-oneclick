@@ -114,6 +114,8 @@ async function captureRetro(page, input) {
 
   const deadline = Date.now() + 90000; // 最多等 90 秒，等新作品出现在列表
   let extract = null;
+  let titleMatch = null; // 标题匹配上（日期/计数可能还没渲染）
+  let fullMatch = null;  // 标题 + 日期 + 计数都齐了
   while (Date.now() < deadline) {
     await page.waitForTimeout(3000);
     extract = await page.evaluate(
@@ -148,16 +150,23 @@ async function captureRetro(page, input) {
       },
       { descPrefix, titlePrefix },
     );
-    if (extract && extract.matched) break;
+    if (extract && extract.matched) {
+      if (!titleMatch) titleMatch = extract.matched;
+      // 标题先渲染，日期和计数晚一步；等它们也出来再收，否则记录不全
+      if (extract.matched.time && extract.matched.metrics && extract.matched.metrics.length > 0) {
+        fullMatch = extract.matched;
+        break;
+      }
+    }
   }
 
-  const chosen = extract && (extract.matched || extract.top);
+  const chosen = fullMatch || titleMatch || (extract && extract.top) || null;
   const retro = {
     capturedAt: new Date().toISOString(),
     publishTitle: input.title || "",
     publishDesc: input.desc || "",
     publishTags: input.tags || [],
-    matchMethod: extract && extract.matched ? "text-prefix" : "top-row",
+    matchMethod: titleMatch || fullMatch ? "text-prefix" : "top-row",
     matchedTitle: chosen ? chosen.title : null,
     publishDate: chosen ? chosen.time : null,
     metricsAtPublish: chosen ? chosen.metrics : null,
