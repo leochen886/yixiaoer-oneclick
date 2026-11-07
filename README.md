@@ -122,3 +122,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-sph.ps1 "视�
 - **只针对视频号一个平台**（其它平台见 `yxer` CLI）。
 - **完播率 / 3 秒跳出率暂未采集**——它在视频号助手后台的 WebSocket 数据里，当前只采集了列表页可见的 5 项计数 + 评论。
 - 视频号助手前端结构偶尔改版，`scripts/ego/` 下的选择器可能需要跟着更新。
+
+## License
+
+[MIT](LICENSE)
