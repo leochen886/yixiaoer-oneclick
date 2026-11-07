@@ -485,6 +485,7 @@ try {
         tags            = @($copy.Tags | ForEach-Object { [string]$_ })
         declareOriginal = ([int]$cfg['createType'] -eq 1)
         noPublish       = [bool]$NoPublish
+        runDir          = $runDir
     }
     Write-JsonFile -Path $EgoInputPath -Object $egoInput
     Write-JsonFile -Path (Join-Path $runDir 'ego-input.json') -Object $egoInput
