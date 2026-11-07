@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-pending-retros.ps1",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
