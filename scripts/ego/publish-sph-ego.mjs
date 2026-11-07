@@ -1,6 +1,6 @@
 // 视频号一键发布（ego 版）—— 浏览器自动化脚本
 // 由 scripts\oneclick-sph-ego.ps1 调用，不要手动运行。
-// 输入：C:/Users/CL/ego/publish-sph-ego-input.json
+// 输入：本脚本同目录 publish-sph-ego-input.json（由 oneclick-sph-ego.ps1 写入，见 INPUT_PATH）
 //   { videoPath, title, desc, tags, noPublish }
 // 输出：最后一行固定打印 RESULT=OK / RESULT=FAIL / RESULT=NO_PUBLISH / RESULT=NEED_LOGIN
 

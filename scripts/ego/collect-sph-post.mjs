@@ -1,6 +1,6 @@
 // 视频号复盘采集（ego 版）—— 数据半环第 2 块
 // 由 scripts\review-sph.ps1 调用，不要手动运行。
-// 输入：C:/Users/CL/ego/collect-sph-post-input.json
+// 输入：本脚本同目录 collect-sph-post-input.json（由 review-sph.ps1 写入，见 INPUT_PATH）
 //   { runDir, publishDesc, publishTitle, publishDate, metricsAtPublish }
 // 输出：<runDir>/report.md；最后一行打印 RESULT=OK / RESULT=FAIL
 

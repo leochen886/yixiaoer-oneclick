@@ -38,7 +38,7 @@
 - 任何一步失败会停下并打印原因，日志和中间文件留在 `publish-runs/<时间戳>_<视频名>/`
 - 账号主人已明确授权该入口**免逐次确认**；首次需要扫码登录视频号助手（微信扫码），之后会话保持、无需再扫
 - 配置：`oneclick-config.json`（`createType` 1=声明原创/2=不声明，`fallbackTags` 兜底标签，`keepRuns` 保留次数）
-- 核心文件：编排脚本 `scripts\oneclick-sph-ego.ps1`，浏览器自动化 `C:\Users\CL\ego\publish-sph-ego.mjs`（走 wujie shadow DOM + CDP 真实点击）
+- 核心文件：编排脚本 `scripts\oneclick-sph-ego.ps1`，浏览器自动化 `scripts\ego\publish-sph-ego.mjs`（走 wujie shadow DOM + CDP 真实点击）
 - 只测流程不发表：`powershell -File scripts\oneclick-sph-ego.ps1 <视频路径> -NoPublish`
 
 ## 目录结构
