@@ -110,13 +110,19 @@ try {
         throw ("该运行目录没有 retro.json（{0}）。只有第 1 块上线后的发布才会生成它。" -f $retroPath)
     }
 
-    # ---- 2. 读 retro.json 组装采集输入 ------------------------------
+    # ---- 2. 读 retro.json + 口播文案，组装采集输入 ------------------
     $retro = [System.IO.File]::ReadAllText($retroPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    $transcript = ''
+    $transcriptPath = Join-Path $runDir 'transcript.txt'
+    if (Test-Path -LiteralPath $transcriptPath) {
+        $transcript = [System.IO.File]::ReadAllText($transcriptPath, [System.Text.Encoding]::UTF8).Trim()
+    }
     $collectInput = [ordered]@{
         runDir           = $runDir
         publishDesc      = [string]$retro.publishDesc
         publishTitle     = [string]$retro.publishTitle
         publishDate      = [string]$retro.publishDate
+        transcript       = $transcript
         metricsAtPublish = @($retro.metricsAtPublish | ForEach-Object { $_ })
     }
     Write-JsonFile -Path $CollectInputPath -Object $collectInput

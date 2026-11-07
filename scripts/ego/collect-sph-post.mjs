@@ -202,6 +202,13 @@ async function main() {
     }
     lines.push("");
 
+    if (input.transcript) {
+      lines.push("## 口播文案");
+      lines.push("");
+      lines.push(input.transcript);
+      lines.push("");
+    }
+
     if (comments !== null) {
       lines.push("## 评论（Top " + comments.length + "）");
       lines.push("");

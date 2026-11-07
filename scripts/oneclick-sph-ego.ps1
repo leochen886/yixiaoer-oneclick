@@ -458,6 +458,10 @@ try {
         Write-Log ("转写完成：{0} 字" -f $transcript.Length) DarkGray
     }
 
+    # 口播文案留档（复盘时按内容拆解用，无论来自 .srt 还是转写）
+    $transcriptArchive = Join-Path $runDir 'transcript.txt'
+    try { [System.IO.File]::WriteAllText($transcriptArchive, $transcript, $Utf8NoBom) } catch { }
+
     # ---- 4. AI 文案 -------------------------------------------------
     $copy = $null
     if ($transcript.Length -ge 10) {
