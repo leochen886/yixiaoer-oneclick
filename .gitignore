@@ -15,6 +15,7 @@
 koubo/
 
 # 发布运行记录与历史产物
+output/
 publish-runs/
 publish-test/
 publish-20261022/

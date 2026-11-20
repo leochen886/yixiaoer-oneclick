@@ -6,7 +6,8 @@
     1) 双击 视频号一键发布.cmd，按提示拖入 / 粘贴视频路径，回车
     2) 或把视频文件直接拖到 视频号一键发布.cmd / 桌面快捷方式上
 
-  自动完成：本地语音转写 -> AI 生成标题描述标签
+  桌面入口：原片先剪气口、生成带字幕的成片。已导出的成片直接使用。
+  发布流程：读取成片字幕 -> AI 生成标题描述标签
             -> ego 浏览器登录视频号助手 -> 上传视频 -> 填文案
             -> 声明原创 -> 正式发表 -> 核实结果
 
@@ -19,7 +20,10 @@ param(
     [string[]]$InputArgs,
 
     # 仅测试用：完成转写、上传、填表后停止，不正式发表
-    [switch]$NoPublish
+    [switch]$NoPublish,
+    [switch]$CutKoubo,
+    # 只生成并核对待发布文件，在任何视频号登录或上传之前结束
+    [switch]$PrepareOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,7 +40,6 @@ $AsrScript = Join-Path $ScriptDir 'oneclick_asr.py'
 
 # ego 相关路径（脚本源码已纳入 scripts\ego\ 版本控制，相对脚本目录解析）
 $EgoDir = Join-Path $ScriptDir 'ego'
-$EgoInputPath = Join-Path $EgoDir 'publish-sph-ego-input.json'
 $EgoScriptPath = Join-Path $EgoDir 'publish-sph-ego.mjs'
 $LoginGatePath = Join-Path $EgoDir 'login-gate.mjs'
 $EgoScriptUrl = 'file:///' + ($EgoScriptPath -replace '\\', '/')
@@ -374,17 +377,19 @@ try {
     Write-Host ''
 
     # ---- 0. 先检测登录态（一打开就检测：已登录直接过，未登录先扫码，登录成功后再传视频） ----
-    if (-not (Get-Command 'ego-browser' -ErrorAction SilentlyContinue)) {
-        throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
-    }
-    if (-not (Test-Path -LiteralPath $LoginGatePath)) {
-        throw ('缺少登录门禁脚本：' + $LoginGatePath)
-    }
-    Write-Log '正在检测视频号登录态……' Cyan
-    $loginResult = Invoke-Ego -TimeoutMs 360000 -ScriptUrl $LoginGateUrl
-    Write-Log ("登录检测结果：{0}" -f $loginResult) DarkGray
-    if ($loginResult -notmatch '^RESULT=LOGIN_OK') {
-        throw ('登录未完成：{0}' -f $loginResult)
+    if (-not $PrepareOnly) {
+        if (-not (Get-Command 'ego-browser' -ErrorAction SilentlyContinue)) {
+            throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
+        }
+        if (-not (Test-Path -LiteralPath $LoginGatePath)) {
+            throw ('缺少登录门禁脚本：' + $LoginGatePath)
+        }
+        Write-Log '正在检测视频号登录态……' Cyan
+        $loginResult = Invoke-Ego -TimeoutMs 360000 -ScriptUrl $LoginGateUrl
+        Write-Log ("登录检测结果：{0}" -f $loginResult) DarkGray
+        if ($loginResult -notmatch '^RESULT=LOGIN_OK') {
+            throw ('登录未完成：{0}' -f $loginResult)
+        }
     }
 
     # ---- 1. 输入 ----------------------------------------------------
@@ -412,7 +417,9 @@ try {
     $ext = [System.IO.Path]::GetExtension($videoPath).ToLowerInvariant()
     if (@('.mp4', '.mov', '.m4v') -notcontains $ext) { throw ("只支持 mp4 / mov 视频，当前文件是 {0}" -f $ext) }
 
-    foreach ($bin in @('ego-browser', 'ffmpeg', 'python', 'claude')) {
+    $requiredBins = @('ffmpeg', 'python')
+    if (-not $PrepareOnly) { $requiredBins += 'claude' }
+    foreach ($bin in $requiredBins) {
         if (-not (Get-Command $bin -ErrorAction SilentlyContinue)) {
             throw ("找不到命令 {0}，请先确认它已安装并在 PATH 中" -f $bin)
         }
@@ -423,18 +430,34 @@ try {
     # ---- 2. 运行目录 ------------------------------------------------
     $videoBase = [System.IO.Path]::GetFileNameWithoutExtension($videoPath)
     $safeBase = $videoBase -replace '[\\/:*?"<>|]', '_'
-    $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $runId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID
     $runDir = Join-Path $RunRoot ('{0}_{1}' -f $runId, $safeBase)
     if (-not (Test-Path -LiteralPath $runDir)) { [void](New-Item -ItemType Directory -Path $runDir -Force) }
     $script:LogFile = Join-Path $runDir 'publish.log'
 
+    Write-Log ("拖入视频：{0}" -f $videoPath) White
+    if ($CutKoubo -or $PrepareOnly) {
+        $pathFile = Join-Path $runDir 'prepared-video.txt'
+        Write-Log '正在准备带字幕的口播成片……' Cyan
+        & python -X utf8 (Join-Path $ScriptDir 'koubo.py') $videoPath --publish-path-file $pathFile
+        if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($pathFile)) {
+            throw '剪口播未完成，已停止发布。'
+        }
+        $videoPath = [IO.File]::ReadAllText($pathFile, [Text.Encoding]::UTF8)
+        if (-not [IO.File]::Exists($videoPath)) { throw '本次成片文件不存在，已停止发布。' }
+    }
     $videoSize = (Get-Item -LiteralPath $videoPath).Length
-    Write-Log ("视频：{0}" -f $videoPath) White
+    Write-Log ("待上传视频：{0}" -f $videoPath) White
     Write-Log ("大小：{0}" -f (Format-Size $videoSize)) DarkGray
 
     # ---- 3. 文案：字幕或本地转写 ------------------------------------
     $transcript = ''
-    $srtPath = Find-Srt $videoPath
+    if ($CutKoubo -or $PrepareOnly) {
+        $srtPath = [IO.Path]::ChangeExtension($videoPath, '.srt')
+        if (-not [IO.File]::Exists($srtPath)) { throw '缺少本次成片的同名字幕，已停止发布。' }
+    } else {
+        $srtPath = Find-Srt $videoPath
+    }
     if ($srtPath) {
         $transcript = Get-SrtText $srtPath
         Write-Log ("使用同名字幕：{0}（{1} 字）" -f (Split-Path -Leaf $srtPath), $transcript.Length) DarkGray
@@ -464,7 +487,7 @@ try {
 
     # ---- 4. AI 文案 -------------------------------------------------
     $copy = $null
-    if ($transcript.Length -ge 10) {
+    if (-not $PrepareOnly -and $transcript.Length -ge 10) {
         Write-Log 'AI 生成标题、描述、标签……' Cyan
         try {
             $copy = Get-AiCopy -Transcript $transcript -VideoBase $videoBase -PromptPath (Join-Path $runDir 'prompt.txt')
@@ -491,12 +514,16 @@ try {
         desc            = [string]$copy.Description
         tags            = @($copy.Tags | ForEach-Object { [string]$_ })
         declareOriginal = ([int]$cfg['createType'] -eq 1)
-        noPublish       = [bool]$NoPublish
+        noPublish       = [bool]($NoPublish -or $PrepareOnly)
         runDir          = $runDir
     }
+    $EgoInputPath = Join-Path $runDir 'ego-input.json'
     Write-JsonFile -Path $EgoInputPath -Object $egoInput
-    Write-JsonFile -Path (Join-Path $runDir 'ego-input.json') -Object $egoInput
     Write-Log ('ego 输入已生成：{0}' -f $EgoInputPath) DarkGray
+    if ($PrepareOnly) {
+        Write-Log ('本地预演完成，待发布文件：{0}' -f $videoPath) Green
+        exit 0
+    }
 
     # ---- 6. ego 浏览器上传 + 发表 ------------------------------------
     if ($NoPublish) {
@@ -504,7 +531,7 @@ try {
     } else {
         Write-Log '开始通过 ego 浏览器上传并发表（大文件需要几分钟，请稍等）……' Cyan
     }
-    $egoResult = Invoke-Ego -TimeoutMs 1500000
+    $egoResult = Invoke-Ego -TimeoutMs 1500000 -ScriptUrl ($EgoScriptUrl + '?input=' + [Uri]::EscapeDataString($EgoInputPath))
     [System.IO.File]::WriteAllText((Join-Path $runDir 'ego-result.txt'), $egoResult, $Utf8NoBom)
     Write-Log ('ego 结果：{0}' -f $egoResult) DarkGray
 

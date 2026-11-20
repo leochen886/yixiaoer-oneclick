@@ -1,6 +1,6 @@
 // 视频号一键发布（ego 版）—— 浏览器自动化脚本
 // 由 scripts\oneclick-sph-ego.ps1 调用，不要手动运行。
-// 输入：本脚本同目录 publish-sph-ego-input.json（由 oneclick-sph-ego.ps1 写入，见 INPUT_PATH）
+// 输入：本次发布目录的 ego-input.json，通过模块 URL 的 input 参数传入。
 //   { videoPath, title, desc, tags, noPublish }
 // 输出：最后一行固定打印 RESULT=OK / RESULT=FAIL / RESULT=NO_PUBLISH / RESULT=NEED_LOGIN
 
@@ -9,7 +9,7 @@ const path = await import("node:path");
 const { fileURLToPath } = await import("node:url");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const INPUT_PATH = path.join(__dirname, "publish-sph-ego-input.json");
+const INPUT_PATH = new URL(import.meta.url).searchParams.get("input") || path.join(__dirname, "publish-sph-ego-input.json");
 const ASSISTANT_HOME = "https://channels.weixin.qq.com/platform";
 const CREATE_URL = "https://channels.weixin.qq.com/platform/post/create";
 
