@@ -7,7 +7,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 from koubo import is_exported_video
-from koubo_plan import caption_events, make_events, make_plan, read_words
+from koubo_plan import align_reviewed_words, caption_events, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, compatible, project_reference, review_captions, transcribe_deepseek
 
 
@@ -80,6 +80,58 @@ class CutPlanTests(unittest.TestCase):
         events = caption_events(tokens, limit=1)
         self.assertEqual(events[0], {"text": "而且", "start": 0, "end": 1.6})
         self.assertEqual("".join(e["text"] for e in events), "而且说实话")
+
+    def test_asr_period_inside_a_nickname_does_not_change_the_screen(self):
+        text = "就是这个口罩。哥，说实话。"
+        spans = [[100*i, 100*i+90] for i in range(10)]
+        spans[7:] = [[a+1800, b+1800] for a, b in spans[7:]]
+        events = caption_events(words(text, spans))
+        self.assertEqual([e["text"] for e in events], ["就是这个口罩哥", "说实话"])
+        self.assertEqual((events[0]["start"], events[0]["end"]), (0, 0.69))
+        for nickname in ("口罩哥", "眼镜姐"):
+            lines = wrap_caption("我刚才看见这个" + nickname + "正在和大家打招呼", limit=10)
+            self.assertIn("\n", lines)
+            self.assertIn(nickname, lines)
+
+    def test_pause_between_sense_groups_starts_a_new_single_line(self):
+        clauses = ["今天下班以后，", "我准备和朋友一起去图书馆看书。", "你呢？"]
+        chars = [c for c in "".join(clauses) if c not in "，。？"]
+        spans = []
+        for i, _ in enumerate(chars):
+            t = 100*i + (550 if i >= 6 else 0)
+            spans.append([t, t+100])
+        events = caption_events(words("".join(clauses), spans))
+        self.assertEqual([e["text"] for e in events], ["今天下班以后", "我准备和朋友一起去图书馆看书", "你呢"])
+        self.assertEqual(events[1]["start"], 1.15)
+
+    def test_two_short_sentences_that_fit_one_line_follow_the_speaker(self):
+        tokens = words("今天就这样了，回头再聊吧。",
+                       [[i*180, (i+1)*180] for i in range(6)]
+                       + [[1400+i*180, 1580+i*180] for i in range(5)])
+        cues = caption_events(tokens, limit=16, wrap=True)
+        self.assertEqual([e["text"] for e in cues], ["今天就这样了", "回头再聊吧"])
+        self.assertEqual(cues[1]["start"], 1.4)
+
+    def test_frozen_replacement_stays_on_its_acoustic_anchors(self):
+        tokens = words("他说 on SOOP 可以。", [[0, 100], [100, 200], [200, 450],
+                                              [450, 700], [700, 850], [850, 1000]])
+        fixed = align_reviewed_words(tokens, [{"start": 0, "end": 1, "text": "他说安苏匹可以"}])
+        self.assertEqual([(w.start, w.end) for w in fixed if w.text == "安苏匹"], [(0.2, 0.7)])
+        cues = caption_events(fixed, limit=3, wrap=True)
+        self.assertEqual("".join(e["text"].replace("\n", "") for e in cues), "他说安苏匹可以")
+        self.assertTrue(any("安苏匹" in e["text"] for e in cues))
+
+    def test_wrap_keeps_corrected_name_and_short_latin_phrase_intact(self):
+        original = "前天有的有哥们儿就问我on SOOP克跟不跟我坚决不跟啊"
+        corrected = original.replace("on SOOP", "安苏匹")
+        self.assertIn("on SOOP", wrap_caption(original))
+        self.assertIn("安苏匹克", wrap_caption(corrected, source_text=original))
+
+    def test_false_stop_after_an_unfinished_predicate_stays_in_the_sentence(self):
+        spans = [[i*100, (i+1)*100] for i in range(9)]
+        spans[5:] = [[a+1600, b+1600] for a, b in spans[5:]]
+        events = caption_events(words("主要原因是。时间不够。", spans))
+        self.assertEqual([e["text"] for e in events], ["主要原因是时间不够"])
 
     def test_replacements_require_relevant_acoustic_support(self):
         self.assertTrue(compatible("正坛", "政坛", "政坛的位置", ""))

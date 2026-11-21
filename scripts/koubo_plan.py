@@ -6,6 +6,7 @@ import unicodedata
 import wave
 from bisect import bisect_left
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 
 import numpy as np
 
@@ -17,6 +18,7 @@ class Word:
     end: float
     new_clause: bool
     space: bool
+    sentence_start: bool = False
 
 
 def read_words(items):
@@ -39,7 +41,8 @@ def read_words(items):
             if not (0 <= start < end and math.isfinite(end)) or (words and start < words[-1].end):
                 raise ValueError("转写时间戳重叠或无效，无法可靠定位剪点。")
             words.append(Word(token[0], start, end, previous == 0 or any(
-                unicodedata.category(c).startswith("P") for c in gap), bool(gap and gap[-1].isspace())))
+                unicodedata.category(c).startswith("P") for c in gap), bool(gap and gap[-1].isspace()),
+                any(c in "。！？!?；;\n" for c in gap) or gap.rstrip().endswith(".")))
             previous = token.end()
     if not words:
         raise ValueError("没有识别到带时间戳的人声。")
@@ -172,12 +175,33 @@ def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12):
     return keep, dropped, edits
 
 
-def lexical_units(words):
-    """Find word boundaries in the whole transcript before considering pauses."""
-    import jieba
+def display_tokens(text):
+    """Tokenize once across ASR punctuation; attach titles to the nouns they qualify."""
+    import jieba.posseg
+    result = []
+    previous_tag = ""
+    for token, tag in jieba.posseg.cut(text):
+        if (token in {"哥", "姐", "叔", "嫂", "爷", "姨", "小哥", "老师", "师傅", "先生", "女士", "们"}
+                and previous_tag.startswith(("n", "eng"))):
+            result[-1] += token
+        else:
+            result.append(token)
+        previous_tag = tag
+    return result
 
+
+def display_width(text):
+    # One Chinese character occupies approximately two Latin columns.
+    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in text)
+
+
+def lexical_units(words):
     pieces = [(" " if w.space else "") + w.text for w in words]
-    boundaries = {end for _, _, end in jieba.tokenize("".join(pieces))}
+    offset = 0
+    boundaries = set()
+    for token in display_tokens("".join(pieces)):
+        offset += len(token)
+        boundaries.add(offset)
     start = offset = 0
     for i, piece in enumerate(pieces):
         offset += len(piece)
@@ -186,37 +210,234 @@ def lexical_units(words):
             start = i + 1
 
 
-def caption_events(words, limit=14):
-    units, lines, size = [], [], 0
+def boundary_quality(left, right):
+    if right in ("的", "地", "得", "了", "吗", "呢", "嘛", "啊", "吧", "呀", "们"):
+        return -1
+    if right in ("但是", "所以", "因为", "而且", "然后", "不过", "如果"):
+        return 1
+    if left.endswith(("。", "？", "！", "，", "吧", "啊", "吗", "呢", "嘛", "呀")):
+        return 1
+    if left in ("是", "就是", "因为", "如果", "在", "把", "被", "对", "给", "从", "向", "很", "最", "这个", "那个"):
+        return -1
+    return 0
 
-    def flush():
-        remaining = sum(len(w.text) + int(w.space) for w in units)
-        while units:
-            target = math.ceil(remaining / math.ceil(remaining / limit))
-            # Choose the closest boundary that fits. A single long name stays whole.
-            length, choices = 0, []
-            for i, w in enumerate(units):
-                length += len(w.text) + int(w.space)
-                if i and length > limit:
+
+def wrap_caption(text, limit=14, source_text=None, *, tokens=None):
+    """Newlines within a cue are simultaneous. Never wrap inside a display token."""
+    total = display_width(text)
+    if total <= 2 * limit:
+        return text
+    if tokens is None:
+        tokens = display_tokens(text)
+    # A corrected name can cross dictionary tokens. Treat the replacement as
+    # one unit, together with any token overlapping its edges.
+    protected = set()
+    if source_text is not None and source_text != text:
+        for tag, _, _, a, b in SequenceMatcher(None, source_text, text, autojunk=False).get_opcodes():
+            if tag in ("insert", "replace") and display_width(text[a:b]) <= 2 * limit:
+                protected.update(range(a+1, b))
+    for match in re.finditer(r"[A-Za-z]+(?: +[A-Za-z]+)+", text):
+        if display_width(match[0]) <= 2 * limit:
+            protected.update(range(match.start()+1, match.end()))
+    if protected:
+        joined, position = [], 0
+        for token in tokens:
+            if position in protected:
+                joined[-1] += token
+            else:
+                joined.append(token)
+            position += len(token)
+        tokens = joined
+    offset = 0
+    choices = []
+    for i, token in enumerate(tokens[:-1], 1):
+        offset += display_width(token)
+        if max(offset, total - offset) <= 2 * limit:
+            choices.append((abs(total - 2 * offset) - 6 * boundary_quality(token, tokens[i]), i))
+    if choices:
+        split = min(choices)[1]
+        return "".join(tokens[:split]).rstrip() + "\n" + "".join(tokens[split:]).lstrip()
+    lines, line = [], ""
+    for token in tokens:
+        if line.strip() and display_width(line + token) > 2 * limit:
+            lines.append(line.rstrip())
+            line = ""
+        line += token if line else token.lstrip()
+    if line.strip():
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def review_groups(words, limit=14):
+    events = []
+
+    def emit_sentence(sentence):
+        pieces = [(" " if w.space else "") + w.text for w in sentence]
+        widths = [display_width(piece) for piece in pieces]
+        start = 0
+        while start < len(sentence):
+            # Fit an entire sentence across two simultaneous lines before making
+            # a time cut. A long sentence gets a cut at its best clause boundary.
+            end, line_width, line_count = start, 0, 1
+            while end < len(sentence):
+                if widths[end] > 2 * limit:
+                    if end == start:
+                        end += 1
                     break
-                choices.append((abs(length - target), i + 1, length))
-            _, end, length = min(choices)
-            line = units[:end]
-            lines.append({"text": "".join((" " if w.space else "") + w.text for w in line).strip(),
-                          "start": line[0].start, "end": line[-1].end})
-            del units[:end]
-            remaining -= length
+                if line_width and line_width + widths[end] > 2 * limit:
+                    if line_count == 2:
+                        break
+                    line_width, line_count = 0, 2
+                line_width += widths[end]
+                end += 1
+            if end < len(sentence):
+                def boundary(i):
+                    right = sentence[i]
+                    quality = boundary_quality(sentence[i-1].text, right.text)
+                    gap = right.start - sentence[i-1].end
+                    return (int(right.new_clause) + quality, gap >= 0.35, i)
+                end = max(range(start+1, end+1), key=boundary)
+            events.append({"text": "".join(pieces[start:end]).strip(),
+                           "start": sentence[start].start, "end": sentence[end-1].end})
+            start = end
 
+    sentence = []
     for w in lexical_units(words):
-        if units:
-            gap = w.start - units[-1].end
-            if gap >= 1.2 or (size >= 4 and (w.new_clause or gap >= 0.35)):
-                flush()
-                size = 0
-        units.append(w)
-        size += len(w.text)
-    flush()
-    return lines
+        if sentence:
+            gap = w.start - sentence[-1].end
+            if (w.sentence_start or gap >= 1.5) and (gap >= 3 or boundary_quality(sentence[-1].text, w.text) >= 0):
+                emit_sentence(sentence)
+                sentence = []
+        sentence.append(w)
+    emit_sentence(sentence)
+    return events
+
+
+def align_reviewed_words(words, events):
+    """Carry approved text onto the word clock. A replacement has only its outer time anchors."""
+    midpoints = [(w.start + w.end) / 2 for w in words]
+    aligned = []
+    for event in events:
+        start, end, text = event["start"], event["end"], event["text"]
+        group = words[bisect_left(midpoints, start):bisect_left(midpoints, end)]
+        if not group:  # A recovered line has no word-level acoustic anchors.
+            aligned.append(Word(text, start, end, True, False, True))
+            continue
+        pieces = [(" " if i and w.space else "") + w.text for i, w in enumerate(group)]
+        source = "".join(pieces)
+        if source == text:
+            aligned.extend(group)
+            continue
+        offsets = {}
+        for tag, a, b, c, d in SequenceMatcher(None, source, text, autojunk=False).get_opcodes():
+            if tag == "equal":
+                offsets.update((a+i, c+i) for i in range(b-a+1))
+            elif tag == "delete":
+                offsets.update((i, c) for i in range(a, b+1))
+            else:
+                offsets[b] = d
+        # A changed span can end on the space before the next spoken word.
+        # That space takes no time, so allow the cut at the preceding word end.
+        for position in range(len(source)-1, -1, -1):
+            if source[position] == " " and position+1 in offsets:
+                offsets.setdefault(position, offsets[position+1])
+        original = approved = first = 0
+        for i, piece in enumerate(pieces):
+            original += len(piece)
+            if original not in offsets:
+                continue
+            stop = offsets[original]
+            part = text[approved:stop]
+            if part.strip():
+                aligned.append(replace(group[first], text=part.lstrip(" "), end=group[i].end,
+                                       space=part.startswith(" ") or (first == 0 and group[0].space)))
+            approved, first = stop, i+1
+    return aligned
+
+
+def caption_events(words, limit=14, *, wrap=False):
+    """Choose display cues on the playback clock, keeping a second line for weak seams."""
+    units = list(lexical_units(words))
+    pieces = [(" " if w.space else "") + w.text for w in units]
+    widths = [display_width(piece) for piece in pieces]
+    n = len(units)
+    # A cheap boundary is a good place to finish a thought. Keep false ASR
+    # stops after an unfinished predicate together, even across a hesitation.
+    costs = [0.0] * (n+1)
+    stops = {0, n}
+    for i in range(1, n):
+        left, right = units[i-1], units[i]
+        gap = right.start - left.end
+        quality = boundary_quality(left.text, right.text)
+        if (right.sentence_start or gap >= 1.0) and (quality >= 0 or gap >= 3):
+            stops.add(i)
+        tail = "".join(w.text for w in units[max(0, i-4):i])
+        head = "".join(w.text for w in units[i:i+4])
+        unfinished = left.text in ("不", "的", "就", "都", "可以", "不能", "绝对", "一定", "我", "你", "他", "大")
+        # Speech recognizers sometimes put a comma between the subject and
+        # an A-not-A question. Keep the predicate with its subject.
+        if re.match(r"(.{1,2})[不没]\1", head):
+            costs[i] = 12
+        elif re.search(r"(.{1,2})[不没]\1$", tail) and right.text in ("我", "你", "他", "她", "我们"):
+            costs[i] = -4
+        elif tail.endswith(("问我", "问他", "问她", "问你", "问道", "说道")):
+            costs[i] = -3
+        elif left.text == "的" and i >= 2 and head.startswith(units[i-2].text + "的") and gap >= 0.15:
+            costs[i] = -3
+        elif quality < 0 or unfinished:
+            costs[i] = 12
+        elif right.new_clause:
+            costs[i] = -3 if gap >= 0.18 or quality > 0 or left.text == "了" else -0.5
+        elif quality > 0:
+            costs[i] = -1
+        elif gap >= 0.18:
+            costs[i] = 2.5
+        elif right.text in ("我", "你", "他", "她", "他们", "我们"):
+            costs[i] = 3
+        else:
+            costs[i] = 8
+
+    events = []
+    breaks = sorted(stops)
+    for begin, end in zip(breaks, breaks[1:]):
+        best = {end: 0.0}
+        following = {}
+        for a in range(end-1, begin-1, -1):
+            width = line_width = 0
+            lines = 1
+            for b in range(a+1, end+1):
+                # An oversized lexical unit must stay intact.
+                piece_width = widths[b-1]
+                if b > a+1 and line_width + piece_width > 2*limit:
+                    if lines == 2 or piece_width > 2*limit:
+                        break
+                    lines, line_width = 2, 0
+                line_width += piece_width
+                width += piece_width
+                duration = units[b-1].end - units[a].start
+                score = 1.5 + max(0.0, 0.85-duration)*10 + max(0.0, duration-4.0)
+                if width > 2*limit:
+                    score += 7
+                if b < end:
+                    score += costs[b]
+                score += best[b]
+                if a not in best or score < best[a]:
+                    best[a], following[a] = score, b
+                if widths[b-1] > 2*limit:
+                    break
+        a = begin
+        while a < end:
+            b = following[a]
+            text = "".join(pieces[a:b]).strip()
+            if wrap:
+                tokens = [pieces[a].lstrip(), *pieces[a+1:b]]
+                text = wrap_caption(text, limit, tokens=tokens)
+            events.append({"text": text, "start": units[a].start, "end": units[b-1].end})
+            a = b
+    for current, upcoming in zip(events, events[1:]):
+        if current["end"] - current["start"] < 0.6:
+            current["end"] = min(upcoming["start"], current["start"] + 0.75)
+    return events
 
 
 def map_kept_words(words, dropped, keep, fps):

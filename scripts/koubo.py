@@ -7,10 +7,12 @@ import math
 import os
 import subprocess
 import tempfile
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
-from koubo_plan import caption_events, make_plan, map_kept_words, quiet_ranges, read_words
+from koubo_plan import (align_reviewed_words, caption_events, make_plan, map_kept_words,
+                        quiet_ranges, read_words, review_groups)
 from koubo_proofread import MODEL, project_reference, read_reference, review_captions, transcribe_deepseek
 from transcribe import transcribe as whisper_transcribe
 from transcribe_funasr import transcribe
@@ -19,7 +21,7 @@ from transcribe_funasr import transcribe
 SPEED = Fraction(13, 10)
 
 
-def probe(source):
+def probe(source, *, with_columns=False):
     info = json.loads(subprocess.check_output([
         "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source)
     ]))
@@ -35,7 +37,20 @@ def probe(source):
     for key in ("r_frame_rate", "avg_frame_rate"):
         rate = video.get(key, "0/0")
         if rate != "0/0" and 0 < Fraction(rate) <= 120:
-            return video["index"], duration, Fraction(rate)
+            result = video["index"], duration, Fraction(rate)
+            if with_columns:
+                aspect = video["width"] / video["height"]
+                sar = video.get("sample_aspect_ratio", "1:1")
+                if sar not in ("N/A", "0:1"):
+                    aspect *= float(Fraction(sar.replace(":", "/")))
+                rotation = next((s["rotation"] for s in video.get("side_data_list", []) if "rotation" in s),
+                                video.get("tags", {}).get("rotate", 0))
+                if int(rotation) % 180 == 90:
+                    aspect = 1 / aspect
+                # The SRT renderer uses a 288-unit play height and a 22-unit font.
+                # Leave space for the side margins and glyph outlines.
+                return (*result, max(1, min(16, math.floor(aspect * 11))))
+            return result
     raise ValueError("无法读取可用的视频帧率。")
 
 
@@ -81,7 +96,7 @@ def render(source, work, video_index, fps, keep, output_frames):
 def export(source, root, min_pause, local_subtitles=False, asr_reference=None, deepseek_audio=False):
     if not math.isfinite(min_pause) or min_pause <= 0:
         raise ValueError("停顿阈值必须大于零。")
-    idx, duration, rate = probe(source)
+    idx, duration, rate, columns = probe(source, with_columns=True)
     receipt = read_reference(asr_reference, source)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
@@ -98,13 +113,16 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         kept_frames = sum(b - a for a, b in keep)
         output_frames = max(1, round(kept_frames / SPEED))
         out_seconds = float(output_frames / rate)
-        events = caption_events(retained)
-        for event in events:
-            event["start"] = min(event["start"] / float(SPEED), out_seconds)
-            event["end"] = min(event["end"] / float(SPEED), out_seconds)
-        events = [e for e in events if round(e["end"]*1000) > round(e["start"]*1000)]
+        timed = [replace(w, start=min(w.start / float(SPEED), out_seconds),
+                         end=min(w.end / float(SPEED), out_seconds)) for w in retained]
+        timed = [w for w in timed if w.start < w.end]
         proof = {"model": None}
         if not local_subtitles:
+            events = review_groups(retained, limit=min(14, columns))
+            for event in events:
+                event["start"] = min(event["start"] / float(SPEED), out_seconds)
+                event["end"] = min(event["end"] / float(SPEED), out_seconds)
+            events = [e for e in events if round(e["end"]*1000) > round(e["start"]*1000)]
             seconds = [(float(a/rate), float(b/rate)) for a, b in keep]
             def on_output(segments):
                 result = project_reference(segments, seconds)
@@ -133,6 +151,8 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                 proof["audio_asr"] = receipt["chunks"]
             proof["reference_asr"] = "faster-whisper-small" if reference else None
             print(f"字幕校对：输入 {proof['prompt_tokens']}、输出 {proof['completion_tokens']} tokens。", flush=True)
+            timed = align_reviewed_words(timed, events)
+        events = caption_events(timed, limit=columns, wrap=True)
         write_srt(work / "captions.srt", events)
         proof["input_mode"] = "explicit_reference" if asr_reference else "source_video_only"
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
@@ -147,7 +167,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         report = {"source": source.name, "duration": duration, "output_duration": out_seconds,
                   "fps": str(rate), "keep": [[float(a/rate), float(b/rate)] for a, b in keep],
                   "word_edits": edits, "speed": float(SPEED),
-                  "cut_duration": float(kept_frames / rate), "proofreading": proof}
+                  "cut_duration": float(kept_frames / rate), "proofreading": proof, "display_cues": events}
         (package / "剪辑记录.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
                                                 encoding="utf-8")
         # Publish the completed set together. A repeat run receives its own folder.
