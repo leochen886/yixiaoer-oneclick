@@ -1,6 +1,8 @@
 import io
 import hashlib
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 import wave
@@ -9,9 +11,9 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import Mock, patch
 from requests.exceptions import ChunkedEncodingError
-from koubo import export, is_exported_video, main as cut_main, restore_source_edits
+from koubo import export, is_exported_video, main as cut_main, restore_source_edits, write_burn_captions
 from koubo_deepseek import apply_corrections, clock_transcript, resolve_span
-from koubo_plan import align_reviewed_words, caption_events, make_events, make_plan, read_words, wrap_caption
+from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
 
 
@@ -33,7 +35,7 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(local.call_count, 2)
                 cloud.assert_not_called()
 
-    def test_both_entry_points_use_cloud_first_and_existing_export_is_reused(self):
+    def test_both_entry_points_compact_raw_video_and_reuse_the_selected_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "sample.mp4"
@@ -42,7 +44,7 @@ class CutPlanTests(unittest.TestCase):
             rate = Fraction(30)
 
             def probe_video(video, *, with_columns=False):
-                result = (0, 2.6 if video == source else 2.0, rate)
+                result = (0, 2.6 if video == source else 1.0, rate)
                 return (*result, 16) if with_columns else result
 
             def mock_plan(video, records, duration, rate, *, send_audio, min_pause):
@@ -57,10 +59,11 @@ class CutPlanTests(unittest.TestCase):
                 return record
 
             def mock_render(video, work, index, fps, keep, frames):
-                self.assertEqual((keep, frames), ([[0,78]], 60))
+                self.assertEqual((keep, frames), ([[0,13],[52,78]], 30))
                 (work / "render.mp4").touch()
 
             with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
+                    patch("koubo.compact_silences", return_value=[(13,52)]) as compact, \
                     patch("koubo.build_cut_plan", side_effect=mock_plan) as build:
                 for extra in ([], ["--publish-path-file",str(path_file)]):
                     with patch("sys.argv", ["koubo.py",str(source),"--output-dir",str(root),*extra]):
@@ -68,12 +71,14 @@ class CutPlanTests(unittest.TestCase):
                     report = json.loads((destination / "剪辑记录.json").read_text(encoding="utf-8"))
                     self.assertEqual(report["speed"], 1.3)
                     self.assertEqual(report["proofreading"]["input_mode"], "deepseek_audio_first")
+                    self.assertEqual([d["reason"] for d in report["cut_decisions"]], ["复核静音"])
                     self.assertNotIn("replay", report)
                 prepared = Path(path_file.read_text(encoding="utf-8"))
                 self.assertEqual(prepared.parent, destination)
                 with patch("sys.argv", ["koubo.py", str(prepared), "--publish-path-file", str(path_file)]):
                     self.assertEqual(cut_main(), destination)
                 self.assertEqual(build.call_count, 2)
+                self.assertEqual(compact.call_count, 2)
 
     def test_cloud_transcript_collapsed_restart_anchors_to_the_retained_take(self):
         raw = words("看见看见了", [[0,120], [120,240], [600,720], [720,840], [840,960]])
@@ -265,6 +270,50 @@ class CutPlanTests(unittest.TestCase):
         cues = caption_events(tokens, limit=16, wrap=True)
         self.assertEqual([e["text"] for e in cues], ["今天就这样了", "回头再聊吧"])
         self.assertEqual(cues[1]["start"], 1.4)
+
+    def test_caption_tokenizer_preserves_the_two_spoken_halves_of_a_couplet(self):
+        text = "出师未捷身先死，长使英雄泪满襟呐。"
+        spans = [[i*220, (i+1)*220] for i in range(15)]
+        cues = caption_events(words(text, spans), limit=16, wrap=True)
+        self.assertEqual([cue["text"] for cue in cues], ["出师未捷身先死", "长使英雄泪满襟呐"])
+        self.assertEqual(cues[1]["start"], spans[7][0]/1000)
+
+    def test_short_final_caption_uses_only_available_tail(self):
+        tokens = words("好。", [[100, 250]])
+        for end, expected in [(None, .25), (.4, .4), (2, .85)]:
+            cue, = caption_events(tokens, end_time=end)
+            self.assertAlmostEqual(cue["end"], expected)
+
+    def test_long_sentence_changes_screen_without_splitting_a_title(self):
+        text = "今天我们请口罩哥仔细讲讲这件事情然后再一起讨论细节"
+        tokens = words(text, [[i*160, (i+1)*160] for i in range(len(text))])
+        for columns in (6, 14):
+            cues = caption_events(tokens, limit=columns, wrap=True)
+            self.assertEqual("".join(c["text"] for c in cues), text)
+            self.assertTrue(all(display_width(c["text"]) <= 2*columns for c in cues))
+            self.assertTrue(any("口罩哥" in c["text"] for c in cues))
+        # Replaying a prior correction with just one acoustic anchor must not
+        # bring its embedded line break back into the exported SRT.
+        old = Word("native\nAI", 0, 1, True, False)
+        self.assertEqual(caption_events([old], 3)[0]["text"], "native AI")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "requires ffmpeg")
+    def test_burned_portrait_subtitle_fits_on_one_visible_line(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = [{"text": "今天口罩哥来了", "start": 0, "end": 1},
+                      {"text": "WideWorkspaceWideWorkspace", "start": 1, "end": 2}]
+            write_burn_captions(root / "captions.ass", events, 6)
+            data = subprocess.check_output([
+                "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=black:s=320x568:r=1:d=2",
+                "-vf", "ass=captions.ass", "-frames:v", "2", "-pix_fmt", "gray", "-f", "rawvideo", "-"
+            ], cwd=root)
+            for frame in np.frombuffer(data, dtype=np.uint8).reshape(2, 568, 320):
+                y, x = np.where(frame > 100)
+                self.assertGreater(len(x), 0)
+                self.assertTrue(0 < x.min() <= x.max() < 319)
+                self.assertLessEqual(y.max() - y.min(), 44)  # one 22-unit line at a 568px play height
 
     def test_frozen_replacement_stays_on_its_acoustic_anchors(self):
         tokens = words("他说 on SOOP 可以。", [[0, 100], [100, 200], [200, 450],

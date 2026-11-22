@@ -11,7 +11,7 @@ from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
 
-from koubo_deepseek import build_cut_plan
+from koubo_deepseek import build_cut_plan, compact_silences
 from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
                         quiet_ranges, read_words, review_groups)
 from koubo_proofread import read_reference, review_captions
@@ -66,14 +66,48 @@ def write_srt(path, events):
                             for i, e in enumerate(events, 1)), encoding="utf-8")
 
 
+def write_burn_captions(path, events, columns):
+    # Match the previous SRT renderer's coordinate system, font and margins.
+    # ASS WrapStyle 2 disables automatic wrapping inside the encoded video.
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Microsoft YaHei,22,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1.2,0,2,10,10,30,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    def stamp(seconds):
+        seconds, cs = divmod(round(seconds * 100), 100)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        return f"{hours}:{minutes:02}:{seconds:02}.{cs:02}"
+
+    with path.open("w", encoding="utf-8") as out:
+        out.write(header)
+        for cue in events:
+            text = cue["text"]
+            # Allow one em per glyph, including wide Latin letters. An
+            # indivisible oversized term stays intact and scales for this cue.
+            size = 22 * columns / max(len(text), columns)
+            style = rf"{{\fs{size:.3f}}}" if size < 22 else ""
+            # A literal backslash must never introduce an ASS newline or tag.
+            literal = text.replace("\\", "\\\u2060").replace("{", r"\{").replace("}", r"\}")
+            out.write(f"Dialogue: 0,{stamp(cue['start'])},{stamp(cue['end'])},Default,,0,0,0,,{style}{literal}\n")
+
+
 def render(source, work, video_index, fps, keep, output_frames):
     select = "+".join(f"between(n,{a},{b-1})" for a, b in keep)
     # Select CFR video frames once. Rebase their PTS before rendering subtitles.
-    style = "FontName=Microsoft YaHei,Bold=1,FontSize=22,Outline=1.2,Shadow=0,MarginV=30"
     video = (f"[0:{video_index}]fps={fps}:start_time=0,select='{select}',setpts=N,"
              f"settb=AVTB,setpts=PTS*{SPEED.denominator}/{SPEED.numerator},fps={fps},"
              f"tpad=stop=2:stop_mode=clone,trim=end_frame={output_frames},"
-             f"subtitles=captions.srt:force_style='{style}'[v]")
+             f"ass=captions.ass[v]")
     # Audio is trimmed to the same frame boundaries, at sample precision.
     labels = "".join(f"[src{i}]" for i in range(len(keep)))
     def samples(frame):
@@ -166,10 +200,28 @@ def restore_source_edits(source, duration, rate, report_path, restore_ids):
     return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits
 
 
+def compact_word_clock(words, cuts, base_keep, fps):
+    """Project both ends through verified silence. Earlier speech cuts were checked separately."""
+    def base_time(frame):
+        return sum(max(0, min(frame, b)-a) for a,b in base_keep) / fps
+
+    intervals = [(base_time(a),base_time(b)) for a,b in cuts]
+    def project(t):
+        return t - sum(max(0., min(t,b)-a) for a,b in intervals)
+
+    mapped = [replace(w, start=project(w.start), end=project(w.end)) for w in words]
+    if any(w.end <= w.start + 1e-8 for w in mapped):
+        raise ValueError("静音剪点吞掉了完整的字幕词，已停止导出。")
+    return mapped
+
+
 def export(source, root, min_pause, local_subtitles=False, asr_reference=None, deepseek_audio=None,
-           cut_report=None, restore_ids=()):
+           cut_report=None, restore_ids=(), compact_pauses=None):
     if not math.isfinite(min_pause) or min_pause <= 0:
         raise ValueError("停顿阈值必须大于零。")
+    if compact_pauses is None:
+        # New recordings use the compact rhythm; a replay follows its saved cuts.
+        compact_pauses = cut_report is None
     idx, duration, rate, columns = probe(source, with_columns=True)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
@@ -185,7 +237,26 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                                   send_audio=True, min_pause=min_pause)
             words, proof, decisions, keep, dropped, edits = restore_source_edits(
                 source, duration, rate, plan, ())
-        retained = map_kept_words(words, dropped, keep, float(rate))
+        frames = round(duration * float(rate))
+        if compact_pauses and not any(d["reason"] == "复核静音" for d in decisions):
+            print("正在按紧凑节奏复核原声静音…", flush=True)
+            # Restored intervals are reserved too: a new pass must not undo an explicit restore.
+            eligible = kept_ranges(frames, [d["frames"] for d in decisions])
+            spoken = [w for i,w in enumerate(words) if i not in dropped]
+            for a,b in compact_silences(source, duration, float(rate), spoken, eligible):
+                decisions.append({"id":f"{a}-{b}", "frames":[a,b], "source_start":float(a/rate),
+                                  "source_end":float(b/rate), "reason":"复核静音",
+                                  "first_word":None, "last_word":None})
+            decisions.sort(key=lambda d: d["frames"])
+        active = [d for d in decisions if not d.get("restored")]
+        tight = [d["frames"] for d in active if d["reason"] == "复核静音"]
+        if tight:
+            base_keep = kept_ranges(frames, [d["frames"] for d in active if d["reason"] != "复核静音"])
+            retained = map_kept_words(words, dropped, base_keep, float(rate))
+            retained = compact_word_clock(retained, tight, base_keep, float(rate))
+            keep = kept_ranges(frames, [d["frames"] for d in active])
+        else:
+            retained = map_kept_words(words, dropped, keep, float(rate))
         kept_frames = sum(b - a for a, b in keep)
         output_frames = max(1, round(kept_frames / SPEED))
         out_seconds = float(output_frames / rate)
@@ -201,8 +272,9 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                 entry["output_time"] = output_time(entry["source_time"])
         for decision in decisions:
             decision["output_time"] = output_time(decision["source_start"])
-        events = caption_events(timed, limit=columns, wrap=True)
+        events = caption_events(timed, limit=columns, end_time=out_seconds)
         write_srt(work / "captions.srt", events)
+        write_burn_captions(work / "captions.ass", events, columns)
         proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
@@ -275,6 +347,8 @@ def main():
     parser.add_argument("--publish-path-file", type=Path, help="为发布入口准备视频，并写回本次成片的绝对路径")
     parser.add_argument("--cut-report", type=Path, help="沿用原片的剪点与自动校对稿，在本机重新导出")
     parser.add_argument("--restore-cut", action="append", default=[], help="恢复指定剪点 ID，可重复使用")
+    parser.add_argument("--compact-pauses", action="store_true", default=None,
+                        help="复核并收紧静音（新原片默认启用；重导旧剪辑记录时可指定）")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--local-subtitles", action="store_true", help="离线导出，使用本地转写字幕")
     inputs.add_argument("--asr-reference", type=Path, help="读取与本片绑定的本地原声听写记录")
@@ -308,7 +382,7 @@ def main():
         else:
             destination = export(source, args.output_dir.absolute(), args.min_pause,
                                  args.local_subtitles, args.asr_reference, args.deepseek_audio,
-                                 args.cut_report, args.restore_cut)
+                                 args.cut_report, args.restore_cut, compact_pauses=args.compact_pauses)
             video = destination / (source.stem + "_cut.mp4")
             if args.publish_path_file and not is_exported_video(video):
                 raise ValueError("导出的成片未通过核对，已停止准备发布。")

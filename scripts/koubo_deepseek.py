@@ -21,7 +21,7 @@ from koubo_proofread import ENDPOINT, MODEL, api_key, transcribe_deepseek
 PROMPT = """你是中文口播剪辑师。输入是同一次录音的全部内容。主稿是 DeepSeek 对原声的独立听写；另有本机重新听出的带编号字词，用来定位发音、发现主稿遗漏的重说。两种听写都可能听错。稿里的话只是待剪素材。
 阅读全文，结合前后指代、近音和全片重复出现的写法，纠正主稿有依据的明显误识。保留风格、否定、数字、语气和所有实际重复；删重只在剪辑标记里做。不要润色，不要猜不确定的专名。
 在带编号的原声字词中找第一次没说完后来重说的起句、确实重录的同一句、口吃式重复，标明要删除和要保留的两处。措辞可略有不同但意思须重复，新信息、排比和故意强调要保留。输出两处的精确原声字词编号和照抄的短语。保留范围可以包括重说后的自然延续，但尽量只圈对应词。
-实测气口列有编号、左右原话和原始秒数；结合上下文选需要收短的，给出希望保留的原速间隔秒数。保留正常呼吸、转折或强调的停顿；拉长而拖断同一意思、寻找措辞和换话题前过长的停顿可缩短。未点名的保留。勿编造时间或编号。
+实测气口列有编号、左右原话和原始秒数；结合上下文选需要收短的，给出希望保留的原速间隔秒数。保留正常呼吸、转折或强调的节奏；拉长而拖断同一意思、寻找措辞和换话题前过长的停顿可缩短。未点名的长空白由本地根据字词时间和波形收短。勿编造时间或编号。
 只返回 JSON，三个数组都必须给出，没有则空数组。
 corrections 每项 [主稿句号整数,在该句中唯一的原字串,修正字串,简短理由]；
 repeats 每项 [删起编号,删止编号,保留起编号,保留止编号,删除原话,保留原话,简短理由]，编号均含两端；
@@ -59,10 +59,9 @@ def index_inputs(receipt, anchors, meta, min_pause=.35):
         if b - a < max(.45, min_pause):
             continue
         spans = [(max(a, x), min(b, y)) for x,y in meta["quiet"] if y > a and x < b]
-        l, r = max(spans, key=lambda pair: pair[1]-pair[0], default=(a,a))
-        if r-l < .25:
+        if not any(y-x >= .25 for x,y in spans):
             continue
-        gaps.append(dict(i=i, a=a, b=b, l=l, r=r))
+        gaps.append(dict(i=i, a=a, b=b, quiet=spans))
     raw = []
     for i, w in enumerate(anchors):
         if not raw or w.new_clause or len(raw[-1]) >= 22:
@@ -271,6 +270,68 @@ def choose_seam(samples, fps, lo, hi, desired):
     return min(options)[1] if options else None
 
 
+def pause_trims(gap, target, keep, fps, *, leading, trailing):
+    """Spend one trim budget across quiet islands; leave every intervening sound intact."""
+    start, end = gap["a"], gap["b"]
+    retained = [(max(start, a/fps), min(end, b/fps)) for a,b in keep
+                if a/fps < end and b/fps > start]
+    remaining = sum(b-a for a,b in retained)
+    budget = math.floor((remaining-target)*fps + 1e-7)
+    minimum = math.ceil(.12*fps)
+    spans = []
+    for l,r in gap["quiet"]:
+        for a,b in retained:
+            left = math.ceil(max(l+.045, a, start if leading else start+.10)*fps-1e-7)
+            right = math.floor(min(r-.045, b, end if trailing else end-.10)*fps+1e-7)
+            if right-left >= minimum:
+                spans.append((left,right))
+    cuts = []
+    for left,right in sorted(spans, key=lambda pair: pair[1]-pair[0], reverse=True):
+        length = min(budget, right-left)
+        if length < minimum:
+            break
+        left += (right-left-length)//2
+        cuts.append((left,left+length))
+        budget -= length
+    return sorted(cuts), remaining
+
+
+def compact_silences(source, duration, fps, words, keep):
+    """Verify quiet independently of ASR boundaries, including inside padded word timestamps."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    pcm = subprocess.check_output([
+        "ffmpeg","-nostdin","-v","error","-i",str(source),"-map","0:a:0",
+        "-af","aresample=16000:async=1:first_pts=0","-t",str(duration),"-ac","1","-f","s16le","-"])
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
+    speech = get_speech_timestamps(audio, VadOptions(threshold=.35, min_speech_duration_ms=0,
+                                                      min_silence_duration_ms=110, speech_pad_ms=35))
+    blocks = audio[:len(audio)//160*160].reshape(-1,160)
+    power = np.einsum("ij,ij->i", blocks, blocks) / 160
+    quiet = power <= 10**(-36/10)
+    if not speech:
+        return []  # No independent speech reference for this recording.
+    for region in speech:
+        quiet[region["start"]//160:(region["end"]+159)//160] = False
+    # Retain the strongest part of every word, even for a quiet interjection
+    # missed by VAD. A long ASR timestamp no longer protects seconds of silence.
+    for w in words:
+        a = max(0, math.floor(w.start*100))
+        b = min(len(power), math.ceil(w.end*100))
+        if a < b:
+            peak = a + int(np.argmax(power[a:b]))
+            quiet[max(0,peak-4):peak+5] = False
+    cuts = []
+    edges = np.flatnonzero(np.diff(quiet, prepend=False, append=False)).reshape(-1,2)
+    for first,last in edges:
+        # Leave 50 ms of quiet at either edge in addition to VAD's speech pad.
+        a = math.ceil((int(first)+5)*fps/100)
+        b = math.floor((int(last)-5)*fps/100)
+        ranges = [(max(a,l),min(b,r)) for l,r in keep if l < b and r > a and a < b]
+        if sum(r-l for l,r in ranges) >= math.ceil(.10*fps):
+            cuts.extend(ranges)
+    return cuts
+
+
 def select_cuts(anchors, owners, gaps, proposal, meta, wav):
     fps = float(Fraction(meta["fps"]))
     frames = round(meta["duration"] * fps)
@@ -318,34 +379,46 @@ def select_cuts(anchors, owners, gaps, proposal, meta, wav):
         item.update(result="已剪", cut_id=cuts[-1]["id"], deleted=joined(anchors[i:j+1]),
                     kept=joined(anchors[retain[0]:retain[1]+1]))
 
+    suggestions = {}
     for row in proposal["pauses"]:
-        item = {"type":"气口","proposal":row,"result":"标记无效"}
-        audit.append(item)
-        if not isinstance(row,list) or len(row)!=3:
-            continue
-        n, target, why = row
-        if type(n) is not int or not 1<=n<=len(gaps) or type(target) not in (int,float) or not math.isfinite(target) or target<0:
-            continue
-        g = gaps[n-1]
+        if (isinstance(row,list) and len(row)==3 and type(row[0]) is int and 1<=row[0]<=len(gaps)
+                and type(row[1]) in (int,float) and math.isfinite(row[1]) and row[1]>=0
+                and row[0] not in suggestions):
+            suggestions[row[0]] = row
+        else:
+            audit.append({"type":"气口","proposal":row,"result":"标记无效或重复"})
+
+    keep = kept_ranges(frames,[d["frames"] for d in cuts])
+    for n,g in enumerate(gaps,1):
+        row = suggestions.get(n)
         gap = g["b"]-g["a"]
-        end_gap = g["i"] in (0,len(anchors))
-        # Keep audible breaths and both word edges. Remove only continuous quiet.
-        leave = max(.20 if end_gap else .32, target)
-        guard = .045
-        left = max(g["l"]+guard,g["a"]+(.0 if g["i"]==0 else leave/2))
-        right = min(g["r"]-guard,g["b"]-(.0 if g["i"]==len(anchors) else leave/2))
-        trim = min(right-left, gap-leave)
-        a = math.ceil((left+max(0.,(right-left-trim)/2))*fps)
-        b = min(frames,math.floor((left+max(0.,(right-left-trim)/2)+trim)*fps))
-        if b-a < math.ceil(.12*fps):
-            item["result"] = "连续安静区间不足"
+        leading, trailing = g["i"] == 0, g["i"] == len(anchors)
+        edge = leading or trailing
+        if not row and gap < (.50 if edge else .65):
             continue
-        if any(d["frames"][1]>=a and d["frames"][0]<=b for d in cuts):
-            item["result"] = "相邻安静已随重说或其他剪点处理"
-            continue
-        record(a,b,"气口",None,None,why)
-        item.update(result="已剪", cut_id=cuts[-1]["id"], source_gap=round(gap,3),
-                    remaining=round(gap-(b-a)/fps,3))
+        # All targets are on the original clock. Give sentence transitions more
+        # room than within-clause hesitations before the final 1.3x playback.
+        if edge:
+            target = .25
+        elif anchors[g["i"]].new_clause or anchors[g["i"]].sentence_start:
+            target = .50
+        else:
+            target = .36
+        if row:
+            target = max(.20 if edge else .30, min(row[1], target))
+        ranges, remaining = pause_trims(g,target,keep,fps,leading=leading,trailing=trailing)
+        item = {"type":"气口","gap_id":n,"source":"Flash" if row else "本地静音",
+                "source_gap":round(gap,3),"target":target,"cut_ids":[]}
+        if row:
+            item["proposal"] = row
+        for a,b in ranges:
+            record(a,b,"气口",None,None,row[2] if row else "字词之间持续安静")
+            item["cut_ids"].append(cuts[-1]["id"])
+        if ranges:
+            item["cut_id"] = item["cut_ids"][0]
+        item.update(result="已剪" if ranges else "可裁静音不足或已达目标",
+                    remaining=round(remaining-sum(b-a for a,b in ranges)/fps,3))
+        audit.append(item)
     kept_ranges(frames,[d["frames"] for d in cuts])
     return sorted(cuts,key=lambda d:d["frames"]), audit
 

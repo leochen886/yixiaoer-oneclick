@@ -1,10 +1,13 @@
 import json
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from koubo_deepseek import ask_flash
+from koubo import compact_word_clock
+from koubo_deepseek import ask_flash, compact_silences, index_inputs, pause_trims, select_cuts
+from koubo_plan import Word
 
 
 def decisions(corrections=(), repeats=(), pauses=()):
@@ -16,6 +19,56 @@ def response(request_id, reason, content):
             "usage": {"completion_tokens": 10, "completion_tokens_details": {"reasoning_tokens": 3}},
             "choices": [{"finish_reason": reason, "message": {"content": content}}]}
     return Mock(**{"json.return_value": data})
+
+
+class PauseTests(unittest.TestCase):
+    @patch("faster_whisper.vad.get_speech_timestamps")
+    @patch("koubo_deepseek.subprocess.check_output")
+    def test_compact_quiet_inside_a_padded_word_preserves_voice_and_word_text(self, decode, vad):
+        import numpy as np
+        audio = np.zeros(3*16000, dtype="<i2")
+        audio[16000:17600] = 1500  # Audible transient not classified as speech.
+        decode.return_value = audio.tobytes()
+        vad.return_value = [{"start":0, "end":4000}, {"start":40000, "end":48000}]
+        word = Word("cloud", .10, 2.9, True, False)
+        # One pre-existing edit inside the pause must not be subtracted twice.
+        keep = [(0,40),(45,90)]
+        cuts = compact_silences(Path("example.mp4"), 3, 30, [word], keep)
+        self.assertTrue(cuts)
+        self.assertTrue(all(a/30 >= .25 and b/30 <= 2.5 for a,b in cuts))
+        self.assertTrue(all(b/30 <= 1 or a/30 >= 1.1 for a,b in cuts))
+        self.assertTrue(all(b<=40 or a>=45 for a,b in cuts))
+        mapped, = compact_word_clock([Word("cloud",.1,2.9-5/30,True,False)],cuts,keep,30)
+        self.assertEqual(mapped.text, word.text)
+        self.assertAlmostEqual(mapped.start, .1)
+        self.assertAlmostEqual(mapped.end, 2.9-(5+sum(b-a for a,b in cuts))/30)
+        vad.return_value = []
+        self.assertEqual(compact_silences(Path("example.mp4"), 3, 30, [word], keep), [])
+
+    def test_unmarked_long_gap_is_shortened_without_cutting_the_sound_between_quiet_runs(self):
+        anchors = [Word("甲",0,.3,True,False), Word("乙",1.9,2.1,True,False)]
+        meta = {"fps":"30","duration":2.1,"quiet":[(.3,1.),(1.20,1.9)]}
+        _, gaps, _ = index_inputs({"chunks":[]}, anchors, meta)
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp)/"source.wav"
+            with wave.open(str(wav),"wb") as f:
+                f.setparams((1,2,16000,0,"NONE",""))
+                f.writeframes(bytes(33600*2))
+            for proposed in ([], [[1,1.5,"句末长停顿"]]):
+                cuts, audit = select_cuts(anchors,[0,1],gaps,decisions(pauses=proposed),meta,wav)
+                self.assertEqual(len(cuts),2)
+                self.assertLessEqual(cuts[0]["source_end"],1.)
+                self.assertGreaterEqual(cuts[1]["source_start"],1.2)
+                self.assertEqual(audit[0]["source"],"Flash" if proposed else "本地静音")
+                self.assertAlmostEqual(audit[0]["remaining"],.50,delta=.06)
+
+    def test_pause_budget_excludes_frames_already_deleted_with_a_repeat(self):
+        gap = {"a":.5,"b":2.5,"quiet":[(.5,2.5)]}
+        cuts, remaining = pause_trims(gap,.5,[(0,30),(70,90)],30,leading=False,trailing=False)
+        self.assertAlmostEqual(remaining,2-40/30)
+        self.assertTrue(cuts)
+        self.assertTrue(all(b<=30 or a>=70 for a,b in cuts))
+        self.assertAlmostEqual(remaining-sum(b-a for a,b in cuts)/30,.5)
 
 
 class FlashLengthTests(unittest.TestCase):

@@ -20,7 +20,7 @@
 | Windows 10 / 11 | 运行环境 | 脚本基于 Windows PowerShell 5.1 |
 | ego-browser（ego-lite） | 浏览器自动化 | 首次需扫码登录视频号助手，之后会话保持 |
 | ffmpeg | 抽首帧封面、抽音频 | 需在 PATH 中 |
-| Python 3.10+ | 本地语音转写 | 使用 FunASR（离线）或 faster-whisper |
+| Python 3.10+ | 本地字词定位与人声检测 | 使用 FunASR 和 faster-whisper |
 | Claude Code CLI（`claude`） | 生成标题 / 描述 / 标签 | 需可用的 Claude 账号 |
 
 > 默认剪口播会把所选原片的音轨发给 DeepSeek 官方语音识别，再把听写全文、字词位置和候选停顿发给 DeepSeek Flash。画面在本机剪辑和导出。发布文案使用本机 `claude` 命令生成。
@@ -33,11 +33,13 @@
 
 1. 按原速提取音轨，发送给 DeepSeek ASR，按原片顺序拼成听写全文。本机用 FunASR 获取字词时间，并从波形测出连续安静区间。
 2. DeepSeek Flash 读取全文和原声位置，校正有依据的错词，标出重说的前后两遍、需要缩短的气口和希望保留的停顿长度。
-3. 程序把标记对回原片。重说要能定位两遍发音，并在前一遍两端找到合适的剪点才会删除。气口只缩短连续安静的部分。模型建议和实际执行结果均写入记录。
+3. 程序把标记对回原片。重说要能定位两遍发音，并在前一遍两端找到合适的剪点才会删除。气口会同时检查 Flash 标记和本地字词之间的长静音。句内、分句和片头片尾分别控制留白；呼吸声隔开的几段静音可分别收短。剪辑记录列出每个气口的来源、目标时长、实际余量和剪点。
 4. 画面和声音共用同一张原片剪点表，固定以 **1.3 倍速**导出，保留人声音调。记录中的 `cut_decisions` 列出每一刀的原因、原片起止、剪点 ID 和成片位置。
-5. 把保留词的时间换算到成片上，按语意和停顿换幕，优先单行，保护完整词和称呼。较长分句可在同一幕换行。MP4 烧录的字幕和同名 SRT 使用同一份排版。
+5. 把保留词的时间换算到成片上，每幕只显示一行字幕。长句优先在分句或停顿处换幕，完整词和称呼保持在一起。遇到一行放不下的完整词，烧录时单独缩小该幕字号。MP4 和同名 SRT 使用相同的分幕和字幕文字。
 
 用 `--cut-report` 可以沿用已校对的原速逐字稿和剪点，在本机重新排版导出。要恢复某一刀，先在记录里找到该剪点的 `id`，再加上 `--restore-cut`。可以一次恢复多刀。
+
+两个桌面入口处理新原片时都默认使用紧凑节奏。程序用本机 faster-whisper 附带的人声检测器和波形复核静音，包括被较长词时间戳覆盖的空白。这些剪点在记录中标为「复核静音」。重导旧剪辑记录时沿用当时的节奏；要给旧记录也加上静音复核，可在 `--cut-report` 后指定记录路径，再加 `--compact-pauses`。
 
 ```powershell
 python -X utf8 scripts/koubo.py "原片.mp4" --cut-report "成片目录/剪辑记录.json" --restore-cut "起始帧-结束帧"
@@ -55,7 +57,7 @@ python -X utf8 scripts/koubo.py "原片.mp4" --cut-report "成片目录/剪辑�
 python -X utf8 scripts/koubo.py "D:\视频\原片.mp4" --min-pause 0.6
 ```
 
-本入口需要 FFmpeg、ffprobe、NumPy、FunASR，以及本机已缓存的 paraformer-zh、fsmn-vad 和 ct-punc 模型。
+本入口需要 FFmpeg、ffprobe、NumPy、FunASR、faster-whisper（本机人声检测），以及本机已缓存的 paraformer-zh、fsmn-vad 和 ct-punc 模型。
 
 ## 一键发布
 

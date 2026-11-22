@@ -224,12 +224,12 @@ def caption_tagger():
     return POSTokenizer()
 
 
-def display_tokens(text, tagger=None):
+def display_tokens(text, tagger=None, *, hmm=True):
     """Tokenize once across ASR punctuation; attach titles to the nouns they qualify."""
     import jieba.posseg
     result = []
     previous_tag = ""
-    for token, tag in (tagger or jieba.posseg.dt).cut(text):
+    for token, tag in (tagger or jieba.posseg.dt).cut(text, HMM=hmm):
         if (token in {"哥", "姐", "叔", "嫂", "爷", "姨", "小哥", "老师", "师傅", "先生", "女士", "们"}
                 and previous_tag.startswith(("n", "eng"))):
             result[-1] += token
@@ -253,6 +253,21 @@ def lexical_units(words, *, caption_columns=None):
         offset += len(token)
         boundaries.add(offset)
     if caption_columns is not None:
+        # The unknown-word model sees unpunctuated text and can invent a word
+        # spanning two spoken clauses. Recover the acoustic seam unless it is
+        # inside a dictionary word, a title, or an indivisible timing anchor.
+        seams = set()
+        position = 0
+        for i, (word, piece) in enumerate(zip(words, pieces)):
+            if i and (word.new_clause or word.sentence_start or word.start - words[i-1].end >= .30):
+                seams.add(position)
+            position += len(piece)
+        if seams - boundaries:
+            position = 0
+            for token in display_tokens(text, caption_tagger(), hmm=False):
+                position += len(token)
+                if position in seams:
+                    boundaries.add(position)
         for match in re.finditer(r"[A-Za-z]+(?: +[A-Za-z]+)+", text):
             if display_width(match[0]) <= 2 * caption_columns:
                 boundaries.difference_update(range(match.start() + 1, match.end()))
@@ -409,8 +424,14 @@ def align_reviewed_words(words, events):
     return aligned
 
 
-def caption_events(words, limit=14, *, wrap=False):
-    """Choose display cues on the playback clock, keeping a second line for weak seams."""
+def caption_end(start, end, next_start):
+    if end - start < 0.6 and next_start is not None:
+        return max(end, min(next_start, start + 0.75))
+    return end
+
+
+def caption_events(words, limit=14, *, wrap=False, end_time=None):
+    """Fit each cue to one line. Older callers may still pass the wrap keyword."""
     units = list(lexical_units(words, caption_columns=limit))
     pieces = [(" " if w.space else "") + w.text for w in units]
     widths = [display_width(piece) for piece in pieces]
@@ -438,10 +459,14 @@ def caption_events(words, limit=14, *, wrap=False):
             costs[i] = -3
         elif left.text == "的" and i >= 2 and head.startswith(units[i-2].text + "的") and gap >= 0.15:
             costs[i] = -3
+        elif right.sentence_start and gap >= 0.18 and quality < 0:
+            # A pause after an unfinished predicate is a fallback for a long
+            # utterance. Keep short subject/predicate pairs on one screen.
+            costs[i] = 4
         elif quality < 0 or unfinished:
             costs[i] = 12
         elif right.new_clause:
-            costs[i] = -3 if gap >= 0.18 or quality > 0 or left.text == "了" else -0.5
+            costs[i] = -3 if gap >= 0.18 or quality > 0 or left.text == "了" or left.text == right.text else -2
         elif quality > 0:
             costs[i] = -1
         elif gap >= 0.18:
@@ -457,40 +482,36 @@ def caption_events(words, limit=14, *, wrap=False):
         best = {end: 0.0}
         following = {}
         for a in range(end-1, begin-1, -1):
-            width = line_width = 0
-            lines = 1
+            width = 0
             for b in range(a+1, end+1):
-                # An oversized lexical unit must stay intact.
                 piece_width = widths[b-1]
-                if b > a+1 and line_width + piece_width > 2*limit:
-                    if lines == 2 or piece_width > 2*limit:
-                        break
-                    lines, line_width = 2, 0
-                line_width += piece_width
                 width += piece_width
+                # A single indivisible name can be set smaller by the renderer.
+                # Every other overflow needs a new timed cue at a word boundary.
+                if b > a+1 and width > 2*limit:
+                    break
                 duration = units[b-1].end - units[a].start
-                score = 1.5 + max(0.0, 0.85-duration)*10 + max(0.0, duration-4.0)
-                if width > 2*limit:
-                    score += 7
+                # Short calls and interjections need less reading time than a
+                # full line. Count only the hold that can actually be displayed.
+                next_start = units[b].start if b < n else end_time
+                dwell = caption_end(units[a].start, units[b-1].end, next_start) - units[a].start
+                reading_time = min(0.85, 0.32 + 0.03*width)
+                score = 1.5 + max(0.0, reading_time-dwell)*10 + max(0.0, duration-4.0)
                 if b < end:
                     score += costs[b]
                 score += best[b]
                 if a not in best or score < best[a]:
                     best[a], following[a] = score, b
-                if widths[b-1] > 2*limit:
-                    break
         a = begin
         while a < end:
             b = following[a]
-            text = "".join(pieces[a:b]).strip()
-            if wrap:
-                tokens = [pieces[a].lstrip(), *pieces[a+1:b]]
-                text = wrap_caption(text, limit, tokens=tokens)
+            # A replayed correction can contain an embedded newline.
+            text = " ".join("".join(pieces[a:b]).splitlines()).strip()
             events.append({"text": text, "start": units[a].start, "end": units[b-1].end})
             a = b
-    for current, upcoming in zip(events, events[1:]):
-        if current["end"] - current["start"] < 0.6:
-            current["end"] = min(upcoming["start"], current["start"] + 0.75)
+    for i, current in enumerate(events):
+        next_start = events[i+1]["start"] if i+1 < len(events) else end_time
+        current["end"] = caption_end(current["start"], current["end"], next_start)
     return events
 
 
