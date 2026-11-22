@@ -1,5 +1,6 @@
 // 视频号登录门禁：CMD 一打开就先检测登录态，未登录则弹码等扫码
 // 输出 RESULT=LOGIN_OK（已登录 / 扫码成功）或 RESULT=FAIL（超时）
+import { verifyAssistant } from "./sph-posts.mjs";
 const ASSISTANT_HOME = "https://channels.weixin.qq.com/platform";
 
 async function restoreWindow(task) {
@@ -22,7 +23,7 @@ async function main() {
   const task = await taskSpace(SPACE);
   const page = task.page("p1");
   try {
-    await page.goto(ASSISTANT_HOME, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await page.goto(ASSISTANT_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForTimeout(3000);
     let url = await page.url();
 
@@ -44,10 +45,11 @@ async function main() {
         return;
       }
       console.log("[登录检测] 扫码成功，已登录");
-    } else {
-      console.log("[登录检测] 已登录，无需扫码");
     }
+    await verifyAssistant(page);
     console.log("RESULT=LOGIN_OK");
+  } catch (error) {
+    console.log("RESULT=FAIL 无法核实登录状态：" + error.message);
   } finally {
     try { await task.finish({ keep: [] }); } catch (e) {}
   }

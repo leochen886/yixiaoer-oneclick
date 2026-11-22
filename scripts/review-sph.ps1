@@ -24,7 +24,6 @@ $ScriptDir = $PSScriptRoot
 $Root = Split-Path -Parent $ScriptDir
 $RunRoot = Join-Path $Root 'publish-runs'
 $EgoDir = Join-Path $ScriptDir 'ego'
-$CollectInputPath = Join-Path $EgoDir 'collect-sph-post-input.json'
 $CollectScriptPath = Join-Path $EgoDir 'collect-sph-post.mjs'
 $CollectScriptUrl = 'file:///' + ($CollectScriptPath -replace '\\', '/')
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -98,8 +97,11 @@ try {
         if ($matches.Count -eq 0) {
             throw ("在 publish-runs 里没找到包含 '{0}' 的运行目录" -f $rawInput)
         } elseif ($matches.Count -gt 1) {
-            $runDir = ($matches | Sort-Object Name -Descending | Select-Object -First 1).FullName
-            Write-Host ("匹配到 {0} 个目录，取最新：{1}" -f $matches.Count, (Split-Path -Leaf $runDir)) -ForegroundColor Yellow
+            $published = @($matches | Where-Object { [IO.File]::Exists((Join-Path $_.FullName 'retro.json')) })
+            if ($published.Count -ne 1) {
+                throw ("匹配到多个目录，请输入要复盘的完整目录名：" + (($published | ForEach-Object Name) -join '、'))
+            }
+            $runDir = $published[0].FullName
         } else {
             $runDir = $matches[0].FullName
         }
@@ -125,6 +127,15 @@ try {
         transcript       = $transcript
         metricsAtPublish = @($retro.metricsAtPublish | ForEach-Object { $_ })
     }
+    if ($retro.matchMethod -eq 'top-row') {
+        $collectInput.publishDate = ''
+        $collectInput.metricsAtPublish = @()
+    } else {
+        $collectInput['postId'] = [string]$retro.postId
+    }
+    $collectInput['capturedAt'] = [string]$retro.capturedAt
+    $CollectInputPath = Join-Path $runDir ('collect-input-' + [guid]::NewGuid() + '.json')
+    $CollectScriptUrl += '?input=' + [Uri]::EscapeDataString($CollectInputPath)
     Write-JsonFile -Path $CollectInputPath -Object $collectInput
 
     # ---- 3. 跑 ego 采集 --------------------------------------------
@@ -132,7 +143,8 @@ try {
         throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
     }
     Write-Host ('正在复盘：{0}' -f (Split-Path -Leaf $runDir)) -ForegroundColor Cyan
-    $result = Invoke-EgoCollect
+    try { $result = Invoke-EgoCollect }
+    finally { [IO.File]::Delete($CollectInputPath) }
 
     if ($result -match '^RESULT=OK') {
         Write-Host ''

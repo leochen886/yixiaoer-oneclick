@@ -34,7 +34,7 @@ Get-ChildItem -LiteralPath $RunRoot -Directory | ForEach-Object {
     if (Test-Path -LiteralPath $reportPath) { return }          # 已复盘
 
     # 从目录名解析发布时间：yyyyMMdd-HHmmss_视频名
-    $m = [regex]::Match($_.Name, '^(\d{8})-(\d{6})_')
+    $m = [regex]::Match($_.Name, '^(\d{8})-(\d{6})(?:-\d+)?_')
     if (-not $m.Success) { return }
     $pubStr = $m.Groups[1].Value + $m.Groups[2].Value
     try {

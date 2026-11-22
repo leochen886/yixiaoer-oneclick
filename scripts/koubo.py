@@ -5,16 +5,20 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
 
+import numpy as np
+
 from koubo_deepseek import build_cut_plan, compact_silences
+from koubo_hook import prepare_hook
 from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
-                        quiet_ranges, read_words, review_groups)
-from koubo_proofread import read_reference, review_captions
+                        nearby_speech_gaps, quiet_ranges, read_words, review_groups)
+from koubo_proofread import file_sha256, read_reference, review_captions
 from transcribe import open_recognizer
 from transcribe_funasr import transcribe
 
@@ -22,7 +26,7 @@ from transcribe_funasr import transcribe
 SPEED = Fraction(13, 10)
 
 
-def probe(source, *, with_columns=False):
+def probe(source, *, with_layout=False):
     info = json.loads(subprocess.check_output([
         "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(source)
     ]))
@@ -39,8 +43,9 @@ def probe(source, *, with_columns=False):
         rate = video.get(key, "0/0")
         if rate != "0/0" and 0 < Fraction(rate) <= 120:
             result = video["index"], duration, Fraction(rate)
-            if with_columns:
-                aspect = video["width"] / video["height"]
+            if with_layout:
+                width, height = video["width"], video["height"]
+                aspect = width / height
                 sar = video.get("sample_aspect_ratio", "1:1")
                 if sar not in ("N/A", "0:1"):
                     aspect *= float(Fraction(sar.replace(":", "/")))
@@ -48,9 +53,10 @@ def probe(source, *, with_columns=False):
                                 video.get("tags", {}).get("rotate", 0))
                 if int(rotation) % 180 == 90:
                     aspect = 1 / aspect
+                    width, height = height, width
                 # The SRT renderer uses a 288-unit play height and a 22-unit font.
                 # Leave space for the side margins and glyph outlines.
-                return (*result, max(1, min(16, math.floor(aspect * 11))))
+                return (*result, max(1, min(16, math.floor(aspect * 11))), width, height)
             return result
     raise ValueError("无法读取可用的视频帧率。")
 
@@ -64,6 +70,44 @@ def write_srt(path, events):
 
     path.write_text("".join(f"{i}\n{stamp(e['start'])} --> {stamp(e['end'])}\n{e['text']}\n\n"
                             for i, e in enumerate(events, 1)), encoding="utf-8")
+
+
+def check_caption_coverage(video, events, duration):
+    """Listen to subtitle gaps on the exported clock, including the head and tail."""
+    gaps, cursor = [], 0.0
+    for cue in [*events, {"start": duration, "end": duration}]:
+        if cue["start"] - cursor > .24:
+            gaps.append((cursor, cue["start"], cue["start"] - cursor - .24))
+        cursor = max(cursor, cue["end"])
+    audit = {"gaps_checked": 0, "max_uncovered_speech_seconds": 0.0}
+    if not any(seconds >= 1.5 for _, _, seconds in gaps) and not any(nearby_speech_gaps(gaps)):
+        return audit
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+    pcm = subprocess.check_output(["ffmpeg", "-nostdin", "-v", "error", "-i", str(video),
+                                   "-map", "0:a:0", "-ar", "16000", "-ac", "1", "-f", "s16le", "-"])
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768
+    speech = get_speech_timestamps(audio, VadOptions(threshold=.5, min_speech_duration_ms=200,
+                                                     min_silence_duration_ms=180, speech_pad_ms=0))
+    audit["gaps_checked"] = len(gaps)
+    voiced = []
+    for start, end, _ in gaps:
+        # Allow timing jitter at either cue edge. Count only detected speech in the rest.
+        seconds = sum(max(0., min(end-.12, s["end"]/16000) - max(start+.12, s["start"]/16000))
+                      for s in speech)
+        audit["max_uncovered_speech_seconds"] = max(audit["max_uncovered_speech_seconds"], round(seconds, 3))
+        if seconds >= 1.5 and "warning" not in audit:
+            audit["warning"] = (f"成片 {start:.2f}–{end:.2f} 秒字幕空档内"
+                                f"有约 {seconds:.1f} 秒人声。")
+        if seconds > 0:
+            voiced.append((start, end, seconds))
+    if "warning" not in audit:
+        for first, last, total in nearby_speech_gaps(voiced):
+            audit["warning"] = (f"成片 {voiced[first][0]:.2f}–{voiced[last][1]:.2f} 秒内"
+                                f"多处短字幕空档累计有约 {total:.1f} 秒人声。")
+            break
+    if "warning" in audit:
+        print("字幕提醒：" + audit["warning"], flush=True)
+    return audit
 
 
 def write_burn_captions(path, events, columns):
@@ -101,13 +145,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             out.write(f"Dialogue: 0,{stamp(cue['start'])},{stamp(cue['end'])},Default,,0,0,0,,{style}{literal}\n")
 
 
-def render(source, work, video_index, fps, keep, output_frames):
+def render(source, work, video_index, fps, keep, output_frames, hook_filter=None, *, legacy_srt=False):
     select = "+".join(f"between(n,{a},{b-1})" for a, b in keep)
+    overlays = "ass=captions.ass" + ("," + hook_filter if hook_filter else "")
+    if legacy_srt:
+        style = "FontName=Microsoft YaHei,Bold=1,FontSize=22,Outline=1.2,Shadow=0,MarginV=30"
+        overlays = f"subtitles=captions.srt:force_style='{style}'"
     # Select CFR video frames once. Rebase their PTS before rendering subtitles.
     video = (f"[0:{video_index}]fps={fps}:start_time=0,select='{select}',setpts=N,"
              f"settb=AVTB,setpts=PTS*{SPEED.denominator}/{SPEED.numerator},fps={fps},"
              f"tpad=stop=2:stop_mode=clone,trim=end_frame={output_frames},"
-             f"ass=captions.ass[v]")
+             f"{overlays}[v]")
     # Audio is trimmed to the same frame boundaries, at sample precision.
     labels = "".join(f"[src{i}]" for i in range(len(keep)))
     def samples(frame):
@@ -180,6 +228,9 @@ def restore_source_edits(source, duration, rate, report_path, restore_ids):
             or saved.get("source_size", source.stat().st_size) != source.stat().st_size
             or "source_words" not in saved or "cut_decisions" not in saved):
         raise ValueError("剪辑记录与原片不符，或没有保存可恢复的原片剪点。")
+    expected_source = saved.get("source_sha256") or saved.get("proofreading", {}).get("source_sha256")
+    if expected_source and file_sha256(source) != expected_source:
+        raise ValueError("原片 SHA-256 与剪辑记录不符，请选择生成这份记录的原片。")
     words = [Word(**item) for item in saved["source_words"]]
     active = [d for d in saved["cut_decisions"] if not d.get("restored")]
     unknown = set(restore_ids) - {d["id"] for d in active}
@@ -197,7 +248,7 @@ def restore_source_edits(source, duration, rate, report_path, restore_ids):
             dropped.update(range(first, last+1))
             edits.append({"reason": d["reason"], "text": "".join(w.text for w in words[first:last+1]),
                           "start": d["source_start"], "end": d["source_end"]})
-    return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits
+    return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits, saved.get("hook_title")
 
 
 def compact_word_clock(words, cuts, base_keep, fps):
@@ -222,20 +273,22 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
     if compact_pauses is None:
         # New recordings use the compact rhythm; a replay follows its saved cuts.
         compact_pauses = cut_report is None
-    idx, duration, rate, columns = probe(source, with_columns=True)
+    idx, duration, rate, columns, width, height = probe(source, with_layout=True)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
         work = Path(temp)
+        suggested_title = None
         if cut_report:
-            words, proof, decisions, keep, dropped, edits = restore_source_edits(
+            words, proof, decisions, keep, dropped, edits, suggested_title = restore_source_edits(
                 source, duration, rate, cut_report, restore_ids)
         elif local_subtitles or asr_reference or deepseek_audio is False:
             words, proof, decisions, keep, dropped, edits = prepare_source_edits(
                 source, work, duration, rate, min_pause, local_subtitles, asr_reference)
         else:
+            hook_chars = max(1, min(16, int(width * .92 / (height * 100 / 1080))))
             plan = build_cut_plan(source, work / "原声记录", duration, rate,
-                                  send_audio=True, min_pause=min_pause)
-            words, proof, decisions, keep, dropped, edits = restore_source_edits(
+                                  send_audio=True, min_pause=min_pause, hook_chars=hook_chars)
+            words, proof, decisions, keep, dropped, edits, suggested_title = restore_source_edits(
                 source, duration, rate, plan, ())
         frames = round(duration * float(rate))
         if compact_pauses and not any(d["reason"] == "复核静音" for d in decisions):
@@ -243,7 +296,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
             # Restored intervals are reserved too: a new pass must not undo an explicit restore.
             eligible = kept_ranges(frames, [d["frames"] for d in decisions])
             spoken = [w for i,w in enumerate(words) if i not in dropped]
-            for a,b in compact_silences(source, duration, float(rate), spoken, eligible):
+            for a,b in compact_silences(source, duration, float(rate), spoken, eligible, min_pause=min_pause):
                 decisions.append({"id":f"{a}-{b}", "frames":[a,b], "source_start":float(a/rate),
                                   "source_end":float(b/rate), "reason":"复核静音",
                                   "first_word":None, "last_word":None})
@@ -275,17 +328,23 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         events = caption_events(timed, limit=columns, end_time=out_seconds)
         write_srt(work / "captions.srt", events)
         write_burn_captions(work / "captions.ass", events, columns)
+        hook_title, hook_filter = prepare_hook(work, retained, width, height,
+                                               suggested_title=suggested_title)
         proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
-        render(source, work, idx, rate, keep, output_frames)
+        print(f"全片顶部标题：{hook_title}", flush=True)
+        render(source, work, idx, rate, keep, output_frames, hook_filter)
+        coverage = check_caption_coverage(work / "render.mp4", events, out_seconds)
 
         name = source.stem + "_cut"
         package = work / "result"
         package.mkdir()
         (work / "render.mp4").rename(package / (name + ".mp4"))
         (work / "captions.srt").rename(package / (name + ".srt"))
-        report = {"source": source.name, "source_size": source.stat().st_size,
+        report = {"source": source.name, "source_size": source.stat().st_size, "hook_title": hook_title,
+                  "source_sha256": proof.get("source_sha256") or file_sha256(source),
+                  "caption_coverage": coverage, "video_sha256": file_sha256(package / (name + ".mp4")),
                   "duration": duration, "output_duration": out_seconds,
                   "fps": str(rate), "keep": [[float(a/rate), float(b/rate)] for a, b in keep],
                   "word_edits": edits, "speed": float(SPEED), "cut_decisions": decisions,
@@ -314,28 +373,102 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                 version += 1
 
 
-def is_exported_video(video):
+def legacy_cues(srt_bytes):
+    cues = []
+    def seconds(value):
+        h, m, s, ms = map(int, re.split("[:,.]", value))
+        return h * 3600 + m * 60 + s + ms / 1000
+
+    for block in re.split(r"\n\s*\n", srt_bytes.decode("utf-8-sig").replace("\r\n", "\n").strip()):
+        lines = block.splitlines()
+        if len(lines) < 3 or " --> " not in lines[1]:
+            raise ValueError("旧字幕缺少有效时间码，请用原片重新剪辑。")
+        start, end = lines[1].split(" --> ")
+        cues.append({"start": seconds(start), "end": seconds(end), "text": "\n".join(lines[2:])})
+    return cues
+
+
+def reproduce_legacy_hash(video, srt_bytes, info):
+    """Rebuild with the original subtitle renderer, then compare the encoded MP4."""
+    source_name = Path(info["source"]).name
+    folders = (video.parent, video.parent.parent, Path.home() / "Pictures" / "Camera Roll")
+    size = info.get("source_size")
+    source = next((p / source_name for p in folders if (p / source_name).is_file()
+                   and (size is None or (p / source_name).stat().st_size == size)), None)
+    recovery = ("请用原片和 --cut-report 重导。" if "source_words" in info and "cut_decisions" in info
+                else "请将原片拖入剪口播重新剪辑，新的剪点可能不同。")
+    if not source or info.get("speed") != float(SPEED):
+        raise ValueError("无法复核旧成片。" + recovery)
+    index, duration, rate, columns, width, height = probe(source, with_layout=True)
+    if rate != Fraction(info["fps"]) or abs(duration - info["duration"]) > 0.001:
+        raise ValueError("旧剪辑记录与原片不符。" + recovery)
+    events = info.get("display_cues") or legacy_cues(srt_bytes)
+    check_caption_coverage(video, events, info["output_duration"])
+    keep = [(round(a * rate), round(b * rate)) for a, b in info["keep"]]
+    actual = file_sha256(video)
+    with tempfile.TemporaryDirectory(prefix="koubo-verify-") as tmp:
+        work = Path(tmp)
+        if info.get("display_cues"):
+            write_srt(work / "captions.srt", events)
+            if (work / "captions.srt").read_bytes() != srt_bytes:
+                raise ValueError("旧记录中的字幕与所选 SRT 不一致。")
+        (work / "captions.srt").write_bytes(srt_bytes)
+        write_burn_captions(work / "captions.ass", events, columns)
+        overlay = None
+        if info.get("hook_title"):
+            _, overlay = prepare_hook(work, [], width, height, suggested_title=info["hook_title"])
+        modes = [False] if overlay else ([False, True] if info.get("display_cues") else [True])
+        for legacy in modes:
+            render(source.resolve(), work, index, rate, keep, round(info["output_duration"] * rate),
+                   overlay, legacy_srt=legacy)
+            rebuilt = work / "render.mp4"
+            if file_sha256(rebuilt) == actual:
+                return actual
+            rebuilt.unlink()
+    raise ValueError("旧成片与重建的视频不一致。" + recovery)
+
+
+def verified_export_hash(video, *, handoff=None, from_source=False):
     report_path = video.with_name("剪辑记录.json")
     if video.suffix.lower() != ".mp4" or not report_path.is_file():
-        return False
+        return None
     info = json.loads(report_path.read_text(encoding="utf-8-sig"))
     if not isinstance(info, dict) or not isinstance(info.get("source"), str) or "keep" not in info:
-        return False
+        return None
     original = Path(info["source"])
     if video.name == original.name:
-        return False
+        return None
     srt = video.with_suffix(".srt")
     expected_hash = info.get("proofreading", {}).get("srt_sha256")
     canonical_name = video.stem.casefold() == (original.stem + "_cut").casefold()
-    actual_hash = hashlib.sha256(srt.read_bytes()).hexdigest() if expected_hash and srt.is_file() else None
+    subtitle = srt.read_bytes() if srt.is_file() else None
+    actual_hash = hashlib.sha256(subtitle).hexdigest() if subtitle is not None else None
+    digest = info.get("video_sha256")
     if not canonical_name and not (expected_hash and actual_hash == expected_hash):
-        return False
-    if not srt.is_file() or (expected_hash and actual_hash != expected_hash):
+        if not digest or file_sha256(video) != digest:
+            return None
+    if subtitle is None or (expected_hash and actual_hash != expected_hash):
         raise ValueError("成片的同名 SRT 缺失或与剪辑记录不符，已停止准备发布。")
+    if not digest:
+        digest = reproduce_legacy_hash(video, subtitle, info)
+    elif not expected_hash:
+        raise ValueError("剪辑记录缺少与成片配套的 SRT 校验值。")
+    if file_sha256(video) != digest:
+        raise ValueError("所选 MP4 与剪辑记录中的成片 SHA-256 不符，已停止准备发布。")
     _, duration, rate = probe(video)
     if abs(duration - info["output_duration"]) > 1 / float(rate):
         raise ValueError("所选视频时长与剪辑记录不符，已停止准备发布。")
-    return True
+    if info.get("video_sha256") and "caption_coverage" not in info and "display_cues" in info:
+        check_caption_coverage(video, info["display_cues"], duration)
+    if handoff is not None:
+        handoff.with_suffix(".srt").write_bytes(subtitle)
+        source_key = info.get("source_sha256") or info.get("proofreading", {}).get("source_sha256")
+        handoff.with_suffix(".publish-key").write_text((source_key or digest) if from_source else digest, encoding="ascii")
+    return digest
+
+
+def is_exported_video(video):
+    return bool(verified_export_hash(video))
 
 
 def main():
@@ -375,7 +508,8 @@ def main():
         source = Path(video_path).absolute()
         if not source.is_file():
             raise ValueError(f"找不到视频文件：{source}")
-        if args.publish_path_file and is_exported_video(source):
+        digest = verified_export_hash(source, handoff=args.publish_path_file) if args.publish_path_file else None
+        if digest:
             video = source
             destination = video.parent
             print("已核对成片和同名字幕，直接使用所选版本。")
@@ -384,9 +518,12 @@ def main():
                                  args.local_subtitles, args.asr_reference, args.deepseek_audio,
                                  args.cut_report, args.restore_cut, compact_pauses=args.compact_pauses)
             video = destination / (source.stem + "_cut.mp4")
-            if args.publish_path_file and not is_exported_video(video):
-                raise ValueError("导出的成片未通过核对，已停止准备发布。")
+            if args.publish_path_file:
+                digest = verified_export_hash(video, handoff=args.publish_path_file, from_source=True)
+                if not digest:
+                    raise ValueError("导出的成片未通过核对，已停止准备发布。")
         if args.publish_path_file:
+            args.publish_path_file.with_suffix(".sha256").write_text(digest, encoding="ascii")
             args.publish_path_file.write_text(str(video), encoding="utf-8")
     except (ValueError, OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"剪口播失败：{exc}\n")

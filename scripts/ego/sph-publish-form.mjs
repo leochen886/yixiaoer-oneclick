@@ -88,7 +88,7 @@ function readReceipt() {
   return { clicked: window.__sphPublishClicked, notice, url: location.href };
 }
 
-export async function publishFromForm(page, noPublish, timeout = 60000) {
+export async function publishFromForm(page, noPublish, timeout = 60000, beforeSubmit) {
   const deadline = Date.now() + timeout;
   while (true) {
     const state = await inspectForm(page, !noPublish);
@@ -100,6 +100,10 @@ export async function publishFromForm(page, noPublish, timeout = 60000) {
   if (noPublish) return "RESULT=NO_PUBLISH";
 
   const before = await page.evaluate(readReceipt);
+  if (beforeSubmit) {
+    const prior = await beforeSubmit();
+    if (prior) return prior;
+  }
   let dispatchError = "";
   try {
     await page.click(FORM_BUTTONS + ENABLED + ':text-is("发表")', { timeout: 8000, label: "点击发表" });

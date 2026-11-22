@@ -50,6 +50,18 @@ def read_words(items):
     return words
 
 
+def nearby_speech_gaps(intervals):
+    """Yield nearby groups with at least 1.5 seconds of unmatched speech in 8 seconds."""
+    left, total = 0, 0.
+    for right, (_, end, seconds) in enumerate(intervals):
+        total += seconds
+        while left <= right and end - intervals[left][0] > 8:
+            total -= intervals[left][2]
+            left += 1
+        if left < right and total >= 1.5 - 1e-8:
+            yield left, right, total
+
+
 def quiet_ranges(wav_path):
     """Return continuous quiet runs. Every 10 ms block must pass the RMS test."""
     with wave.open(str(wav_path), "rb") as wav:

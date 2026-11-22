@@ -11,8 +11,9 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import Mock, patch
 from requests.exceptions import ChunkedEncodingError
-from koubo import export, is_exported_video, main as cut_main, restore_source_edits, write_burn_captions
-from koubo_deepseek import apply_corrections, clock_transcript, resolve_span
+from koubo import check_caption_coverage, export, is_exported_video, main as cut_main, restore_source_edits, write_burn_captions
+from koubo_deepseek import apply_corrections, clock_transcript, resolve_span, spoken, supplement_hearing
+from koubo_hook import prepare_hook
 from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
 
@@ -22,11 +23,23 @@ def words(text, spans):
 
 
 class CutPlanTests(unittest.TestCase):
+    def test_offline_hook_uses_the_recording_and_keeps_the_approved_size_on_portrait_video(self):
+        tokens = [Word("为什么越浇越蔫", 0, 1, True, False),
+                  Word("花怎么养", 1, 2, True, False)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wide, _ = prepare_hook(root, tokens, 1920, 1080)
+            self.assertEqual(wide, "为什么越浇越蔫？")
+            narrow, draw = prepare_hook(root, tokens, 1080, 1920, suggested_title=wide)
+            self.assertEqual(narrow, "花怎么养？")
+            self.assertIn("fontsize=178", draw)
+            self.assertIn("x=(w-tw)/2:y=71", draw)
+
     def test_offline_or_explicit_reference_does_not_send_the_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "sample.mp4"
-            with patch("koubo.probe", return_value=(0, 2.0, Fraction(30), 16)), \
+            with patch("koubo.probe", return_value=(0, 2.0, Fraction(30), 16, 1920, 1080)), \
                     patch("koubo.build_cut_plan") as cloud, \
                     patch("koubo.prepare_source_edits", side_effect=ValueError("local path")) as local:
                 for mode in ({"local_subtitles": True}, {"asr_reference": root / "reference.json"}):
@@ -43,23 +56,27 @@ class CutPlanTests(unittest.TestCase):
             path_file = root / "prepared-video.txt"
             rate = Fraction(30)
 
-            def probe_video(video, *, with_columns=False):
+            def probe_video(video, *, with_layout=False):
                 result = (0, 2.6 if video == source else 1.0, rate)
-                return (*result, 16) if with_columns else result
+                return (*result, 16, 1920, 1080) if with_layout else result
 
-            def mock_plan(video, records, duration, rate, *, send_audio, min_pause):
+            def mock_plan(video, records, duration, rate, *, send_audio, min_pause, hook_chars):
                 self.assertEqual(video, source)
                 self.assertTrue(send_audio)
                 self.assertEqual(min_pause, .35)
+                self.assertEqual(hook_chars, 16)
                 records.mkdir()
                 record = records / "plan.json"
                 record.write_text(json.dumps({"source":video.name, "fps":str(rate), "duration":duration,
                     "cut_decisions":[], "source_words":[asdict(w) for w in words("早", [[0,260]])],
-                    "proofreading":{"input_mode":"deepseek_audio_first"}}), encoding="utf-8")
+                    "proofreading":{"input_mode":"deepseek_audio_first"}, "hook_title":"早起有多早？"}), encoding="utf-8")
                 return record
 
-            def mock_render(video, work, index, fps, keep, frames):
+            def mock_render(video, work, index, fps, keep, frames, hook_filter):
                 self.assertEqual((keep, frames), ([[0,13],[52,78]], 30))
+                self.assertEqual((work / "hook.txt").read_text(encoding="utf-8"), "早起有多早？")
+                self.assertNotIn("早起有多早", (work / "captions.srt").read_text(encoding="utf-8"))
+                self.assertIn("fontsize=100:fontcolor=0xFFDA20:borderw=6:bordercolor=black:x=(w-tw)/2:y=40", hook_filter)
                 (work / "render.mp4").touch()
 
             with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
@@ -70,6 +87,7 @@ class CutPlanTests(unittest.TestCase):
                         destination = cut_main()
                     report = json.loads((destination / "剪辑记录.json").read_text(encoding="utf-8"))
                     self.assertEqual(report["speed"], 1.3)
+                    self.assertEqual(report["hook_title"], "早起有多早？")
                     self.assertEqual(report["proofreading"]["input_mode"], "deepseek_audio_first")
                     self.assertEqual([d["reason"] for d in report["cut_decisions"]], ["复核静音"])
                     self.assertNotIn("replay", report)
@@ -77,16 +95,118 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(prepared.parent, destination)
                 with patch("sys.argv", ["koubo.py", str(prepared), "--publish-path-file", str(path_file)]):
                     self.assertEqual(cut_main(), destination)
+                self.assertEqual(path_file.with_suffix(".srt").read_bytes(), prepared.with_suffix(".srt").read_bytes())
+                self.assertEqual(path_file.with_suffix(".publish-key").read_text(), hashlib.sha256(b"").hexdigest())
                 self.assertEqual(build.call_count, 2)
                 self.assertEqual(compact.call_count, 2)
 
+    def test_replay_checks_source_digest_even_when_size_and_name_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            source.write_bytes(b"blue")
+            report = root / "report.json"
+            report.write_text(json.dumps({"source": source.name, "source_size": 4, "duration": 2,
+                "fps": "25", "source_words": [], "cut_decisions": [],
+                "proofreading": {"source_sha256": hashlib.sha256(b"reds").hexdigest()}}))
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                restore_source_edits(source, 2, Fraction(25), report, ())
+
+    def test_default_corrections_preserve_polarity_and_quantity(self):
+        for before, after in [("不能降到10元", "能降到100元"), ("1.5元", "15元")]:
+            corrected, audit = apply_corrections([(0, before)], [[1, before, after, "模型建议"]])
+            self.assertEqual(corrected, [before])
+            self.assertFalse(audit[0]["applied"])
+
+    @patch("faster_whisper.vad.get_speech_timestamps", return_value=[{"start": 0, "end": 5*16000}])
+    @patch("koubo.subprocess.check_output", return_value=bytes(5*32000))
+    def test_short_gap_counts_toward_aggregate(self, decode, detect):
+        events = [{"start": 0, "end": .8}, {"start": 2.5, "end": 3.3}, {"start": 3.69, "end": 4.5}]
+        audit = check_caption_coverage("fixture.mp4", events, 4.5)
+        self.assertIn("多处短字幕空档", audit["warning"])
+
     def test_cloud_transcript_collapsed_restart_anchors_to_the_retained_take(self):
         raw = words("看见看见了", [[0,120], [120,240], [600,720], [720,840], [840,960]])
+        self.assertEqual(supplement_hearing([{"start":0,"end":1,"text":"看见了。"}], raw)[1], [])
         timed, owners = clock_transcript([{"start":0,"end":1}], [(0,"看见了。")], ["看见了。"], raw)
         self.assertEqual(owners, [2,3,4])
         self.assertEqual(timed[0].start, .6)
         self.assertEqual(resolve_span(raw,1,2,"看见"), (0,1))
         self.assertIsNone(resolve_span(raw,1,2,"错引"))
+
+    def test_long_primary_asr_omission_is_reviewed_and_clocked_to_real_speech(self):
+        text = "先开场。今天从头开始讲字幕。最后结束。"
+        raw = words(text, [(i*300,(i+1)*300) for i in range(len(text.replace("。", "")))])
+        chunks = [{"start":0, "end":5, "text":"先开场。最后结束。"}]
+        repaired, audit = supplement_hearing(chunks, raw)
+        self.assertEqual(chunks[0]["text"], "先开场。最后结束。")
+        self.assertEqual(audit[0]["local_text"], "今天从头开始讲字幕")
+        line = repaired[0]["text"]
+        timed, _ = clock_transcript(repaired, [(0,line)], [line], raw)
+        self.assertEqual([(w.text,w.start,w.end) for w in timed],
+                         [(w.text,w.start,w.end) for w in raw])
+
+    def test_nearby_short_omissions_are_restored_with_original_word_times(self):
+        said = "要算力有算力要人才有人才要芯片有芯片"
+        raw = words(said, [(i*400,(i+1)*400) for i in range(len(said))])
+        chunks = [{"start":0, "end":4.8, "text":"要算力，要人才。"},
+                  {"start":4.8, "end":7.2, "text":"要芯片。"}]
+        fixed, changes = supplement_hearing(chunks, raw)
+        self.assertEqual(len(changes), 3)
+        lines = [c["text"] for c in fixed]
+        timed, _ = clock_transcript(fixed, list(enumerate(lines)), lines, raw)
+        self.assertEqual([(w.text,w.start,w.end) for w in timed],
+                         [(w.text,w.start,w.end) for w in raw])
+        final = caption_events(timed, limit=16, end_time=7.2)
+        self.assertEqual(spoken("".join(cue["text"] for cue in final)), said)
+
+    def test_transliterated_brand_is_an_alternate_not_a_replacement(self):
+        said = "我试用了恰特吉皮提效果很好"
+        raw = words(said, [(i*320,(i+1)*320) for i in range(len(said))])
+        main = "我试用了ChatGPT，效果很好。"
+        variants = []
+        fixed, changes = supplement_hearing([{"start":0,"end":5,"text":main}], raw, name_variants=variants)
+        self.assertEqual((fixed[0]["text"], changes), (main, []))
+        self.assertEqual((variants[0]["primary"], variants[0]["local"]), ("ChatGPT", "恰特吉皮提"))
+        reviewed, audit = apply_corrections([(0,main)], [[1,"ChatGPT","恰特吉皮提","音译"],
+                                              [1,"很好","不错","校字"]], variants[0]["names"])
+        self.assertEqual([r["applied"] for r in audit], [False,True])
+        self.assertIn("ChatGPT", reviewed[0])
+
+    @patch("faster_whisper.vad.get_speech_timestamps")
+    @patch("koubo.subprocess.check_output", return_value=bytes(8*32000))
+    def test_export_audit_aggregates_speech_across_short_gaps(self, decode, detect):
+        cues = [{"start":0.0,"end":.75},{"start":1.6,"end":3.15},
+                {"start":4,"end":6}]
+        detect.return_value = [{"start":0, "end":int(7.2*16000)}]
+        audit = check_caption_coverage("video.mp4", cues, 7.2)
+        self.assertIn("多处短字幕空档", audit["warning"])
+        detect.return_value = [{"start":int(c["start"]*16000),"end":int(c["end"]*16000)} for c in cues]
+        quiet = check_caption_coverage("video.mp4", cues, 7.2)
+        self.assertEqual(quiet["max_uncovered_speech_seconds"], 0)
+        self.assertNotIn("warning", quiet)
+
+    @patch("faster_whisper.vad.get_speech_timestamps")
+    @patch("koubo.subprocess.check_output", return_value=bytes(8*32000))
+    def test_caption_audit_ignores_silence_but_detects_unsubtitled_speech(self, decode, detect):
+        cue = {"start":2.5, "end":3.0}
+        detect.return_value = [{"start":40000,"end":47000}]
+        self.assertEqual(check_caption_coverage("video.mp4",[cue],8)["max_uncovered_speech_seconds"], 0)
+        for start in (0,4):
+            detect.return_value = [{"start":start*16000,"end":(start+2)*16000}]
+            audit = check_caption_coverage("video.mp4", [cue], 8)
+            self.assertIn("字幕空档内", audit["warning"])
+            self.assertGreaterEqual(audit["max_uncovered_speech_seconds"], 1.5)
+
+    @patch("faster_whisper.vad.get_speech_timestamps", return_value=[{"start": 480000, "end": 512000}])
+    @patch("koubo.subprocess.check_output", return_value=bytes(33 * 32000))
+    def test_two_second_caption_gap_warns_and_returns(self, decode, detect):
+        events = [{"start": 0, "end": 29.99}, {"start": 32, "end": 33}]
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            audit = check_caption_coverage("sample.mp4", events, 33)
+        self.assertIn("29.99–32.00", audit["warning"])
+        self.assertIn("1.8 秒人声", audit["warning"])
+        self.assertIn(audit["warning"], output.getvalue())
 
     def test_cloud_first_correction_is_bound_to_a_unique_quote_in_its_sentence(self):
         lines = [(0,"用这个开源的库"), (0,"这句这句重说")]
@@ -118,7 +238,8 @@ class CutPlanTests(unittest.TestCase):
             report.write_text(json.dumps({"source": source.name, "fps": "30", "duration": 4.1,
                 "source_size": 0, "source_words": [asdict(w) for w in tokens], "cut_decisions": decisions,
                 "proofreading": {"model": "test"}}), encoding="utf-8")
-            restored, _, updated, keep, dropped, _ = restore_source_edits(source, 4.1, 30, report, [decisions[0]["id"]])
+            restored, _, updated, keep, dropped, _, title = restore_source_edits(source, 4.1, 30, report, [decisions[0]["id"]])
+            self.assertIsNone(title)
             self.assertEqual(restored, tokens)
             self.assertFalse(dropped)
             self.assertTrue(updated[0]["restored"])
@@ -155,14 +276,19 @@ class CutPlanTests(unittest.TestCase):
     def test_publish_recognizes_export_and_stops_on_mismatched_subtitles(self):
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "example_cut.mp4"
+            video.write_bytes(b"verified MP4")
             srt = video.with_suffix(".srt")
             srt.write_bytes(b"subtitles")
             report = {"source": "example.mp4", "keep": [[0, 2]], "output_duration": 1.5,
+                      "video_sha256": hashlib.sha256(video.read_bytes()).hexdigest(),
                       "proofreading": {"srt_sha256": hashlib.sha256(srt.read_bytes()).hexdigest()}}
             video.with_name("剪辑记录.json").write_text(json.dumps(report), encoding="utf-8")
             self.assertFalse(is_exported_video(video.with_name("example.mp4")))
             with patch("koubo.probe", return_value=(0, 1.5, 25)):
                 self.assertTrue(is_exported_video(video))
+                video.write_bytes(b"previous MP4")
+                with self.assertRaisesRegex(ValueError, "MP4.*SHA-256"):
+                    is_exported_video(video)
             srt.write_bytes(b"wrong subtitles")
             with self.assertRaisesRegex(ValueError, "SRT"):
                 is_exported_video(video)
@@ -358,11 +484,11 @@ class CutPlanTests(unittest.TestCase):
             path = Path(tmp) / "source.wav"
             with wave.open(str(path), "wb") as out:
                 out.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
-                out.writeframes(bytes(121 * 32000))
-            receipt = transcribe_deepseek(path, [(114, 116)])
+                out.writeframes(bytes(37 * 32000))
+            receipt = transcribe_deepseek(path, [(26, 28)])
         self.assertEqual(receipt["text"], "早上好")
-        self.assertEqual([c["end"] for c in receipt["chunks"]], [115, 121])
-        for request, seconds in zip(post.call_args_list, (115, 6)):
+        self.assertEqual([c["end"] for c in receipt["chunks"]], [27, 37])
+        for request, seconds in zip(post.call_args_list, (27, 10)):
             with wave.open(io.BytesIO(request.kwargs["files"]["file"][1])) as part:
                 self.assertEqual(part.getnframes(), seconds * 16000)
 

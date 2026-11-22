@@ -180,22 +180,26 @@ function Invoke-Ego {
     # stdout 逐行实时打印（登录检测、上传进度等状态行立即显示到终端）
     # 每次只发起一个 ReadLineAsync 并等它完成，避免并发读取导致丢行
     $stdout = New-Object System.Text.StringBuilder
+    $timeoutResult = 'RESULT=FAIL 执行超时'
     $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
     while ($true) {
         $remaining = [int](($deadline - [DateTime]::UtcNow).TotalMilliseconds)
         if ($remaining -le 0) {
             try { $proc.Kill() } catch { }
-            return 'RESULT=FAIL 执行超时'
+            return $timeoutResult
         }
         $readTask = $proc.StandardOutput.ReadLineAsync()
         if (-not $readTask.Wait($remaining)) {
             try { $proc.Kill() } catch { }
-            return 'RESULT=FAIL 执行超时'
+            return $timeoutResult
         }
         $line = $null
         try { $line = $readTask.Result } catch { $line = $null }
         if ($null -eq $line) { break }   # 输出流结束
         [void]$stdout.AppendLine($line)
+        if ($line -eq 'PUBLISH_SUBMITTING' -or $line -eq 'PUBLISH_CLICKED') {
+            $timeoutResult = 'RESULT=UNCONFIRMED 提交后连接超时，请核对作品列表。'
+        }
         if ($line.StartsWith('FORM_TITLE=')) { $script:FormTitle = $line.Substring('FORM_TITLE='.Length) }
         Write-Log $line
     }
@@ -227,14 +231,23 @@ function Write-JsonFile {
     [System.IO.File]::WriteAllText($Path, $json, $Utf8NoBom)
 }
 
+function Get-StreamDigest([IO.Stream]$Stream) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($Stream)).Replace('-', '').ToLowerInvariant() }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-PathDigest([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try { return Get-StreamDigest $stream } finally { $stream.Dispose() }
+}
+
 function Find-Srt {
     param([string]$VideoPath)
     $dir = Split-Path -Parent $VideoPath
     $base = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
     $exact = Join-Path $dir ($base + '.srt')
     if (Test-Path -LiteralPath $exact) { return $exact }
-    $found = @(Get-ChildItem -LiteralPath $dir -Filter ($base + '*.srt') -File -ErrorAction SilentlyContinue)
-    if ($found.Count -eq 1) { return $found[0].FullName }
     return $null
 }
 
@@ -372,6 +385,7 @@ function Get-FallbackCopy {
 }
 
 # ================================================================ 主流程
+$videoReadLock = $null
 try {
     Write-Host ''
     Write-Host '  视频号一键发布（ego）' -ForegroundColor Cyan
@@ -438,7 +452,21 @@ try {
     $script:LogFile = Join-Path $runDir 'publish.log'
 
     Write-Log ("拖入视频：{0}" -f $videoPath) White
-    if ($CutKoubo -or $PrepareOnly) {
+    $prepareProjectVideo = $CutKoubo -or $PrepareOnly
+    $projectRecord = Join-Path ([IO.Path]::GetDirectoryName($videoPath)) '剪辑记录.json'
+    if (-not $prepareProjectVideo -and [IO.File]::Exists($projectRecord)) {
+        $record = [IO.File]::ReadAllText($projectRecord, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $originalName = [string]$record.source
+        $canonicalName = [IO.Path]::GetFileNameWithoutExtension($originalName) + '_cut.mp4'
+        if ($originalName -and [IO.Path]::GetFileName($videoPath) -ne $originalName) {
+            $selectedSrt = [IO.Path]::ChangeExtension($videoPath, '.srt')
+            $prepareProjectVideo = [IO.Path]::GetFileName($videoPath) -eq $canonicalName -or
+                ($record.proofreading.srt_sha256 -and [IO.File]::Exists($selectedSrt) -and
+                 (Get-PathDigest $selectedSrt) -eq $record.proofreading.srt_sha256) -or
+                ($record.video_sha256 -and (Get-PathDigest $videoPath) -eq $record.video_sha256)
+        }
+    }
+    if ($prepareProjectVideo) {
         $pathFile = Join-Path $runDir 'prepared-video.txt'
         Write-Log '正在准备带字幕的口播成片……' Cyan
         $lastCutMessage = ''
@@ -466,15 +494,25 @@ try {
         }
         $videoPath = [IO.File]::ReadAllText($pathFile, [Text.Encoding]::UTF8)
         if (-not [IO.File]::Exists($videoPath)) { throw '本次成片文件不存在，已停止发布。' }
+        $expectedVideoHash = [IO.File]::ReadAllText([IO.Path]::ChangeExtension($pathFile, '.sha256')).Trim()
+        $publishKey = [IO.File]::ReadAllText([IO.Path]::ChangeExtension($pathFile, '.publish-key')).Trim()
     }
+    # Lock the selected bytes for both external videos and project exports.
+    $videoReadLock = [IO.File]::Open($videoPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $videoHash = Get-StreamDigest $videoReadLock
+    if ($prepareProjectVideo -and $videoHash -ne $expectedVideoHash) {
+        throw '已选成片在准备期间发生变化，已停止发布。'
+    }
+    if (-not $prepareProjectVideo) { $publishKey = $videoHash }
+    if ($publishKey -notmatch '^[a-fA-F0-9]{64}$') { throw '作品校验值无效。' }
     $videoSize = (Get-Item -LiteralPath $videoPath).Length
     Write-Log ("待上传视频：{0}" -f $videoPath) White
     Write-Log ("大小：{0}" -f (Format-Size $videoSize)) DarkGray
 
     # ---- 3. 文案：字幕或本地转写 ------------------------------------
     $transcript = ''
-    if ($CutKoubo -or $PrepareOnly) {
-        $srtPath = [IO.Path]::ChangeExtension($videoPath, '.srt')
+    if ($prepareProjectVideo) {
+        $srtPath = [IO.Path]::ChangeExtension($pathFile, '.srt')
         if (-not [IO.File]::Exists($srtPath)) { throw '缺少本次成片的同名字幕，已停止发布。' }
     } else {
         $srtPath = Find-Srt $videoPath
@@ -535,6 +573,8 @@ try {
         desc            = [string]$copy.Description
         tags            = @($copy.Tags | ForEach-Object { [string]$_ })
         declareOriginal = ([int]$cfg['createType'] -eq 1)
+        publishKey      = $publishKey
+        videoHash       = $videoHash
         noPublish       = [bool]($NoPublish -or $PrepareOnly)
         runDir          = $runDir
     }
@@ -553,6 +593,15 @@ try {
         Write-Log '开始通过 ego 浏览器上传并发表（大文件需要几分钟，请稍等）……' Cyan
     }
     $egoResult = Invoke-Ego -TimeoutMs 1500000 -ScriptUrl ($EgoScriptUrl + '?input=' + [Uri]::EscapeDataString($EgoInputPath))
+    $submitReceipt = Join-Path $runDir 'submit-result.txt'
+    if ([IO.File]::Exists($submitReceipt)) {
+        $egoResult = [IO.File]::ReadAllText($submitReceipt).Trim()
+    } elseif ($egoResult -match '^RESULT=FAIL') {
+        $claim = Join-Path (Join-Path $RunRoot '.submissions') ($publishKey.ToLowerInvariant() + '.json')
+        if ([IO.File]::Exists($claim)) {
+            $egoResult = 'RESULT=UNCONFIRMED 发布回执中断，已保留提交记录。'
+        }
+    }
     if ($null -ne $script:FormTitle) { $copy.Title = $script:FormTitle }
     [System.IO.File]::WriteAllText((Join-Path $runDir 'ego-result.txt'), $egoResult, $Utf8NoBom)
     Write-Log ('ego 结果：{0}' -f $egoResult) DarkGray
@@ -571,11 +620,12 @@ try {
     $ok = $false
     switch -Regex ($egoResult) {
         '^RESULT=OK' { Write-Host '  状态  ：发布成功 ✅' -ForegroundColor Green; $ok = $true; break }
+        '^RESULT=ALREADY_PUBLISHED' { Write-Host '  状态  ：同一作品已有成功回执，本次已跳过发表' -ForegroundColor Green; $ok = $true; break }
         '^RESULT=NO_PUBLISH' { Write-Host '  状态  ：预演完成，发表按钮可用，未点击' -ForegroundColor Yellow; $ok = $true; break }
         '^RESULT=NEED_LOGIN' { Write-Host '  状态  ：需要扫码登录' -ForegroundColor Yellow; break }
         '^RESULT=NOT_CLICKED\s*(.*)' { Write-Host ('  状态  ：未点到发表。{0}' -f $Matches[1]) -ForegroundColor Red; break }
         '^RESULT=CLICK_UNKNOWN' { Write-Host '  状态  ：无法确认点击是否送达，请在保留的 ego 页面核对' -ForegroundColor Yellow; break }
-        '^RESULT=UNCONFIRMED' { Write-Host '  状态  ：已点发表，平台结果未确认，请在 ego 中核对' -ForegroundColor Yellow; break }
+        '^RESULT=UNCONFIRMED\s*(.*)' { Write-Host ('  状态  ：提交结果待核对。{0}' -f $Matches[1]) -ForegroundColor Yellow; break }
         default { Write-Host ('  状态  ：失败 ❌  {0}' -f $egoResult) -ForegroundColor Red; break }
     }
 
@@ -583,16 +633,19 @@ try {
     Write-Host '  ==========================================' -ForegroundColor Cyan
     Write-Host ''
 
-    # ---- 8. 清理旧运行目录 -----------------------------------------
-    try {
-        $runs = @(Get-ChildItem -LiteralPath $RunRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
-        $keep = [int]$cfg['keepRuns']
-        if ($runs.Count -gt $keep) {
-            $runs | Select-Object -Skip $keep | ForEach-Object {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
+    # 仅清理已结束任务的可再生中间文件，作品档案和回执长期保留。
+    $keep = [Math]::Max(0, [int]$cfg['keepRuns'])
+    $finished = Get-ChildItem -LiteralPath $RunRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d{8}-\d{6}(?:-\d+)?_' -and
+            -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+            [IO.File]::Exists((Join-Path $_.FullName 'ego-result.txt')) } |
+        Sort-Object Name -Descending | Select-Object -Skip $keep
+    foreach ($run in $finished) {
+        foreach ($name in @('audio.wav', 'prompt.txt')) {
+            $file = Join-Path $run.FullName $name
+            if ([IO.File]::Exists($file)) { Remove-Item -LiteralPath $file -ErrorAction SilentlyContinue }
         }
-    } catch { }
+    }
 
     if ($ok) { exit 0 } else { exit 1 }
 } catch {
@@ -601,4 +654,6 @@ try {
     if ($_.ScriptStackTrace) { Write-Log $_.ScriptStackTrace DarkGray }
     Write-Host ''
     exit 1
+} finally {
+    if ($null -ne $videoReadLock) { $videoReadLock.Dispose() }
 }

@@ -35,6 +35,7 @@ class PauseTests(unittest.TestCase):
         keep = [(0,40),(45,90)]
         cuts = compact_silences(Path("example.mp4"), 3, 30, [word], keep)
         self.assertTrue(cuts)
+        self.assertEqual(compact_silences(Path("example.mp4"), 3, 30, [word], keep, min_pause=5), [])
         self.assertTrue(all(a/30 >= .25 and b/30 <= 2.5 for a,b in cuts))
         self.assertTrue(all(b/30 <= 1 or a/30 >= 1.1 for a,b in cuts))
         self.assertTrue(all(b<=40 or a>=45 for a,b in cuts))

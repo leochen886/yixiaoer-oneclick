@@ -50,10 +50,10 @@ def transcribe_deepseek(wav, quiet):
         rate, total = audio.getframerate(), audio.getnframes()
         start = 0
         while start < total:
-            end = min(start + 120 * rate, total)
+            end = min(start + 30 * rate, total)
             if end < total:
                 pauses = (round((a+b)*rate/2) for a, b in quiet)
-                end = max((p for p in pauses if end-10*rate <= p <= end), default=end)
+                end = max((p for p in pauses if end-5*rate <= p <= end), default=end)
             pcm = io.BytesIO()
             with wave.open(pcm, "wb") as part:
                 part.setparams(audio.getparams())
@@ -74,16 +74,20 @@ def transcribe_deepseek(wav, quiet):
     return {"text": text, "request_id": chunks[0]["request_id"], "chunks": chunks}
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def read_reference(path, video):
     """Only use a local ASR receipt that belongs to this exact source."""
     if path is None:
         return {}
     record = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    digest = hashlib.sha256()
-    with video.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            digest.update(chunk)
-    if record.get("source_sha256") != digest.hexdigest() or not record.get("text"):
+    if record.get("source_sha256") != file_sha256(video) or not record.get("text"):
         raise ValueError("原声听写文件与当前视频不匹配。")
     return record
 

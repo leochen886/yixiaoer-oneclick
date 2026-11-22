@@ -1,15 +1,13 @@
 // 视频号复盘采集（ego 版）—— 数据半环第 2 块
 // 由 scripts\review-sph.ps1 调用，不要手动运行。
-// 输入：本脚本同目录 collect-sph-post-input.json（由 review-sph.ps1 写入，见 INPUT_PATH）
+// 输入：复盘运行目录的 JSON，经模块 URL 传入。
 //   { runDir, publishDesc, publishTitle, publishDate, metricsAtPublish }
 // 输出：<runDir>/report.md；最后一行打印 RESULT=OK / RESULT=FAIL
 
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-const { fileURLToPath } = await import("node:url");
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const INPUT_PATH = path.join(__dirname, "collect-sph-post-input.json");
+import * as fs from "node:fs/promises";
+import { findPost, metricDelta } from "./sph-posts.mjs";
+import { randomUUID } from "node:crypto";
+const INPUT_PATH = new URL(import.meta.url).searchParams.get("input");
 const LIST_URL = "https://channels.weixin.qq.com/platform/post/list";
 const COMMENT_URL = "https://channels.weixin.qq.com/platform/interaction/comment";
 
@@ -21,70 +19,8 @@ async function readInput() {
   return JSON.parse(raw);
 }
 
-async function shadowText(page) {
-  return page.evaluate(() => {
-    const wujie = document.querySelector("wujie-app");
-    const sr = wujie && wujie.shadowRoot;
-    return sr ? sr.textContent || "" : "";
-  });
-}
-
-async function findPost(page, descPrefix, titlePrefix) {
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    const extract = await page.evaluate(
-      ({ descPrefix, titlePrefix }) => {
-        const wujie = document.querySelector("wujie-app");
-        const sr = wujie && wujie.shadowRoot;
-        if (!sr) return { __noShadow: true, matched: null };
-        const items = [...sr.querySelectorAll(".post-feed-item")];
-        const rows = items.map((el) => {
-          const titleEl = el.querySelector(".post-title");
-          const timeEl = el.querySelector(".time-label");
-          const dataItems = [...el.querySelectorAll(".post-data .data-item")];
-          const metrics = dataItems.map((d) => {
-            const num = (d.textContent || "").replace(/\s+/g, "");
-            const icon = d.querySelector("[class*=icon]");
-            const use = d.querySelector("use");
-            return {
-              num,
-              iconCls: icon ? icon.getAttribute("class") || "" : "",
-              useHref: use ? use.getAttribute("xlink:href") || use.getAttribute("href") || "" : "",
-            };
-          });
-          return {
-            title: titleEl ? (titleEl.textContent || "").replace(/\s+/g, " ").trim() : "",
-            time: timeEl ? (timeEl.textContent || "").replace(/\s+/g, " ").trim() : "",
-            metrics,
-          };
-        });
-        let matched = null;
-        for (const r of rows) {
-          if ((descPrefix && r.title.includes(descPrefix)) || (titlePrefix && r.title.includes(titlePrefix))) {
-            matched = r;
-            break;
-          }
-        }
-        return { __noShadow: false, matched, rowCount: rows.length };
-      },
-      { descPrefix, titlePrefix },
-    );
-    if (extract && !extract.__noShadow && extract.matched) return extract;
-    await page.waitForTimeout(3000);
-  }
-  return null;
-}
-
-function parseMetrics(metrics) {
-  return metrics.map((m, i) => ({
-    label: METRIC_LABELS[i] || ("指标" + (i + 1)),
-    value: m.num === "" ? "0" : m.num,
-    icon: m.useHref || m.iconCls,
-  }));
-}
-
 // 进评论管理页，点目标作品，抓 Top20 评论（作者/时间/文本）。失败返回 null。
-async function collectComments(page, descPrefix, titlePrefix) {
+async function collectComments(page, post) {
   await page.goto(COMMENT_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
   await page
     .waitForFunction(
@@ -102,22 +38,22 @@ async function collectComments(page, descPrefix, titlePrefix) {
 
   // 点左侧目标作品（.comment-feed-wrap 行）
   const rect = await page.evaluate(
-    ({ descPrefix, titlePrefix }) => {
-      const wujie = document.querySelector("wujie-app");
-      const sr = wujie && wujie.shadowRoot;
-      if (!sr) return null;
-      const els = [...sr.querySelectorAll(".comment-feed-wrap")];
-      for (const e of els) {
-        const t = (e.textContent || "").replace(/\s+/g, " ").trim();
-        if ((descPrefix && t.includes(descPrefix)) || (titlePrefix && t.includes(titlePrefix))) {
-          e.scrollIntoView({ block: "center" });
-          const r = e.getBoundingClientRect();
-          return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-        }
-      }
-      return null;
-    },
-    { descPrefix, titlePrefix },
+    ({ id, title, time }) => {
+      const root = document.querySelector("wujie-app")?.shadowRoot;
+      if (!root) return null;
+      const clean = value => String(value || "").replace(/\s+/g, " ").trim();
+      const matches = Array.from(root.querySelectorAll(".comment-feed-wrap")).filter(el => {
+        const rowId = el.getAttribute("data-object-id") || el.getAttribute("data-feed-id");
+        if (rowId && id) return rowId === id;
+        const text = clean(el.textContent);
+        return !!clean(title) && text.includes(clean(title)) && !!time && text.includes(clean(time));
+      });
+      if (matches.length !== 1) return null;
+      const el = matches[0];
+      el.scrollIntoView({ block: "center" });
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }, post,
   );
 
   if (!rect) return null;
@@ -147,40 +83,26 @@ async function main() {
   const input = await readInput();
   const task = await taskSpace("sph-review-" + Date.now());
   const page = task.page("p1");
-  const descPrefix = (input.publishDesc || "").replace(/\s+/g, " ").trim().slice(0, 14);
-  const titlePrefix = (input.publishTitle || "").trim().slice(0, 14);
-
   try {
     // 1) 作品列表 → 5 个计数
     await page.goto(LIST_URL, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
     await page.waitForTimeout(2000);
-    const found = await findPost(page, descPrefix, titlePrefix);
-    if (!found || !found.matched) {
-      console.log("RESULT=FAIL 未在作品列表前 20 条找到匹配作品（descPrefix=" + descPrefix + "）");
-      return;
-    }
-    const post = found.matched;
-    const current = parseMetrics(post.metrics);
+    const post = await findPost(page, input);
+    if (!post) throw new Error("未找到与发布记录一致的作品");
+    const display = n => n == null || n === "" ? "—" : String(n);
+    const current = METRIC_LABELS.map((label, i) => ({ label, value: display(post.metrics[i]?.num) }));
 
     // 2) 评论（尽力而为）
     let comments = null;
     try {
-      comments = await collectComments(page, descPrefix, titlePrefix);
+      comments = await collectComments(page, post);
     } catch (e) {
       console.log("COMMENTS_SKIP " + (e && e.message ? e.message : String(e)));
     }
 
     // 3) 组装 report
-    const atPublish = (input.metricsAtPublish || []).map((m, i) => ({
-      label: METRIC_LABELS[i] || ("指标" + (i + 1)),
-      value: m && m.num ? m.num : "0",
-    }));
+    const atPublish = input.metricsAtPublish || [];
     const now = new Date();
-    const delta = (a, b) => {
-      const na = parseInt(String(a).replace(/[^\d]/g, "") || "0", 10);
-      const nb = parseInt(String(b).replace(/[^\d]/g, "") || "0", 10);
-      return isNaN(na) || isNaN(nb) ? "-" : nb - na;
-    };
 
     const lines = [];
     lines.push("# 视频号复盘报告");
@@ -195,10 +117,10 @@ async function main() {
     lines.push("| 指标 | 发布时 | 复盘时 | 变化 |");
     lines.push("|---|---|---|---|");
     for (let i = 0; i < current.length; i++) {
-      const pub = atPublish[i] ? atPublish[i].value : "0";
+      const pub = display(atPublish[i]?.num);
       const cur = current[i].value;
-      const d = delta(pub, cur);
-      lines.push("| " + current[i].label + " | " + pub + " | " + cur + " | " + (d >= 0 ? "+" : "") + d + " |");
+      const d = metricDelta(pub, cur);
+      lines.push("| " + current[i].label + " | " + pub + " | " + cur + " | " + d + " |");
     }
     lines.push("");
 
@@ -222,6 +144,8 @@ async function main() {
       lines.push("");
     }
 
+    if (comments === null) lines.push("## 评论", "", "本次未能核实该作品的评论。", "");
+
     if (input.publishDesc) {
       lines.push("## 原文案");
       lines.push("");
@@ -232,7 +156,9 @@ async function main() {
     const report = lines.join("\n");
     const outPath = input.runDir + "/report.md";
     await fs.mkdir(input.runDir, { recursive: true });
-    await fs.writeFile(outPath, report, "utf8");
+    const temporary = outPath + "." + randomUUID() + ".tmp";
+    await fs.writeFile(temporary, report, "utf8");
+    await fs.rename(temporary, outPath);
 
     console.log("REPORT_WRITTEN " + outPath);
     console.log("RESULT=OK");
