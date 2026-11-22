@@ -18,33 +18,69 @@ export async function fillShortTitle(page, inputTitle) {
   return title;
 }
 
-export async function declareOriginal(page) {
-  const checkbox = ".declare-original-checkbox input[type=checkbox]";
-  const state = () => page.evaluate(({ checkbox, dialog }) => {
-    const root = document.querySelector("wujie-app")?.shadowRoot;
-    return {
-      checked: root?.querySelector(checkbox)?.checked === true,
-      dialog: !!root?.querySelector(dialog)?.getBoundingClientRect().width,
-      agreed: root?.querySelector(".original-proto-wrapper input")?.checked === true,
-    };
-  }, { checkbox, dialog: ORIGINAL_DIALOG });
-  await page.waitForSelector(".declare-original-checkbox label", { state: "visible", timeout: 15000 });
-  let current = await state();
-  if (!current.checked && !current.dialog) {
-    await page.click(".declare-original-checkbox label", { label: "勾选原创声明" });
-    // 已签过协议的账号可能直接勾上，不弹出协议。
-    await page.waitForSelector(ORIGINAL_DIALOG, { state: "visible", timeout: 4000 }).catch(() => {});
-    current = await state();
+// This function is serialized into the page by ego-browser.
+function readOriginalState(dialogSelector) {
+  const roots = [document, ...Array.from(document.querySelectorAll("wujie-app"), app => app.shadowRoot).filter(Boolean)];
+  const visible = el => el.getBoundingClientRect().width > 0 && getComputedStyle(el).visibility !== "hidden";
+  function visibleOne(selector) {
+    const matches = roots.flatMap(root => Array.from(root.querySelectorAll(selector))).filter(visible);
+    if (matches.length > 1) throw new Error("找到多个可见的原创声明控件，请在编辑页核对");
+    return matches[0];
   }
-  if (current.dialog) {
-    if (!current.agreed) await page.click(".original-proto-wrapper label", { label: "勾选原创协议" });
-    await page.click(ORIGINAL_DIALOG + " button" + ENABLED + ':text-is("声明原创")', {
-      timeout: 10000, label: "确认原创声明",
-    });
-    await page.waitForSelector(ORIGINAL_DIALOG, { state: "hidden", timeout: 10000 });
+  function checkbox(scope, selector) {
+    if (!scope) return { checked: false, target: null };
+    const native = scope.querySelector('input[type="checkbox"]');
+    const role = '[role="checkbox"]';
+    const widget = scope.matches(role) ? scope : scope.querySelector(role);
+    const aria = widget?.getAttribute("aria-checked");
+    const marker = ".ant-checkbox-checked,.ant-checkbox-wrapper-checked";
+    let checked = scope.matches(marker) || !!scope.querySelector(marker);
+    if (aria != null) checked = aria === "true";
+    if (native) checked = native.checked;
+    let target = null;
+    if (scope.querySelector("label")) target = selector + " label";
+    else if (widget) target = widget === scope ? selector : selector + " " + role;
+    else if (native) target = selector + ' input[type="checkbox"]';
+    return { checked, target };
   }
-  current = await state();
-  if (!current.checked || current.dialog) throw new Error("原创声明尚未完成");
+  const fieldSelector = ".declare-original-checkbox";
+  const field = checkbox(visibleOne(fieldSelector), fieldSelector);
+  const dialog = visibleOne(dialogSelector);
+  const agreement = checkbox(dialog?.querySelector(".original-proto-wrapper"), dialogSelector + " .original-proto-wrapper");
+  return { checked: field.checked, target: field.target, dialog: !!dialog, agreed: agreement.checked, agreementTarget: agreement.target };
+}
+
+export async function declareOriginal(page, timeout = 15000) {
+  async function waitForState(accept, reason) {
+    const deadline = Date.now() + timeout;
+    while (true) {
+      const state = await page.evaluate(readOriginalState, ORIGINAL_DIALOG);
+      if (accept(state)) return state;
+      if (Date.now() >= deadline) throw new Error("原创声明尚未完成：" + reason);
+      await page.waitForTimeout(250);
+    }
+  }
+  const confirmed = state => state.checked && !state.dialog;
+  let state = await waitForState(s => s.dialog || s.checked || s.target, "未找到可操作的声明控件");
+  if (!state.checked && !state.dialog) {
+    await page.click(state.target, { label: "勾选原创声明" });
+    // Some accounts first show a provisional check and then open the agreement dialog.
+    await page.waitForSelector(ORIGINAL_DIALOG, { state: "visible", timeout: Math.min(4000, timeout) }).catch(() => {});
+    state = await waitForState(s => s.dialog || s.checked, "勾选后未看到协议弹窗或选中标记");
+  }
+  if (state.dialog) {
+    state = await waitForState(s => confirmed(s) || (s.dialog && (s.agreed || s.agreementTarget)), "未找到原创协议勾选项");
+    if (state.dialog) {
+      if (!state.agreed) {
+        await page.click(state.agreementTarget, { label: "勾选原创协议" });
+        await waitForState(s => s.agreed && s.dialog, "协议勾选状态未确认");
+      }
+      await page.click(ORIGINAL_DIALOG + " button" + ENABLED + ':text-is("声明原创")', {
+        timeout, label: "确认原创声明",
+      });
+    }
+  }
+  await waitForState(confirmed, "未看到声明已勾选且协议弹窗已关闭");
   console.log("DECLARE_CONFIRMED");
 }
 

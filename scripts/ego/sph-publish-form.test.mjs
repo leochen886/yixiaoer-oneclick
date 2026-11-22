@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { publishFromForm, shortTitle } from "./sph-publish-form.mjs";
+import { runInNewContext } from "node:vm";
+import { declareOriginal, publishFromForm, shortTitle } from "./sph-publish-form.mjs";
 
 const create = "https://channels.weixin.qq.com/platform/post/create";
 const list = "https://channels.weixin.qq.com/platform/post/list";
@@ -23,6 +24,71 @@ function form({ readiness = { ready: true }, before = {}, after = {}, clickError
     },
   };
 }
+
+const unchecked = { checked: false, target: ".declare-original-checkbox label", dialog: false, agreed: false, agreementTarget: null };
+const checked = { ...unchecked, checked: true };
+const inDialog = { ...unchecked, dialog: true, agreementTarget: ".declare-original-dialog .weui-desktop-dialog .original-proto-wrapper label" };
+
+function originalPage(states) {
+  return {
+    clicks: [],
+    async evaluate() {
+      return states.length > 1 ? states.shift() : states[0];
+    },
+    async waitForTimeout() {},
+    async waitForSelector() { throw new Error("dialog has not appeared yet"); },
+    async click(selector) { this.clicks.push(selector); },
+  };
+}
+
+test("协议弹窗可以延迟出现，确认后等待表单回写，只勾选和确认各一次", async () => {
+  const page = originalPage([unchecked, unchecked, inDialog, inDialog, { ...inDialog, agreed: true }, unchecked, checked]);
+  await declareOriginal(page);
+  assert.deepEqual(page.clicks.slice(0, 2), [unchecked.target, inDialog.agreementTarget]);
+  assert.equal(page.clicks.length, 3);
+  assert.match(page.clicks[2], /:text-is\("声明原创"\)$/);
+});
+
+test("无需协议弹窗的账号只点一次，已经确认的账号直接通过", async () => {
+  const page = originalPage([unchecked, unchecked, checked]);
+  await declareOriginal(page);
+  assert.deepEqual(page.clicks, [unchecked.target]);
+  const existing = originalPage([checked]);
+  await declareOriginal(existing);
+  assert.deepEqual(existing.clicks, []);
+});
+
+test("始终没有选中标记时给出原因并停在编辑页", async () => {
+  const page = originalPage([unchecked]);
+  await assert.rejects(declareOriginal(page, 0), /勾选后未看到协议弹窗或选中标记/);
+  assert.deepEqual(page.clicks, [unchecked.target]);
+});
+
+test("弹窗关闭但声明未生效时不能报告成功", async () => {
+  const agreed = { ...inDialog, agreed: true };
+  const page = originalPage([agreed, agreed, unchecked]);
+  await assert.rejects(declareOriginal(page, 0), /未看到声明已勾选/);
+  assert.equal(page.clicks.length, 1);
+  assert.match(page.clicks[0], /:text-is\("声明原创"\)$/);
+});
+
+test("从可见声明项读取 aria-checked，忽略隐藏表单中未选中的副本", async () => {
+  const checkbox = visible => ({
+    getBoundingClientRect: () => ({ width: visible ? 50 : 0 }),
+    matches: selector => selector === '[role="checkbox"]',
+    getAttribute: name => name === "aria-checked" ? String(visible) : null,
+    querySelector: () => null,
+  });
+  const fields = [checkbox(false), checkbox(true)];
+  const root = { querySelectorAll: selector => selector === ".declare-original-checkbox" ? fields : [] };
+  const document = { querySelectorAll: selector => selector === "wujie-app" ? [{ shadowRoot: root }] : [] };
+  const page = originalPage([]);
+  page.evaluate = (fn, arg) => runInNewContext("(" + fn.toString() + ")(arg)", {
+    document, arg, getComputedStyle: () => ({ visibility: "visible" }),
+  });
+  await declareOriginal(page, 0);
+  assert.deepEqual(page.clicks, []);
+});
 
 test("短标题中英文逗号变成空格，保留支持的问号和书名号", () => {
   assert.equal(shortTitle(" 今天出门，记得带伞 "), "今天出门 记得带伞");
