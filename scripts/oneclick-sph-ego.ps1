@@ -46,6 +46,7 @@ $EgoScriptUrl = 'file:///' + ($EgoScriptPath -replace '\\', '/')
 $LoginGateUrl = 'file:///' + ($LoginGatePath -replace '\\', '/')
 
 $script:LogFile = $null
+$script:FormTitle = $null
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # ---------------------------------------------------------------- 配置
@@ -195,7 +196,8 @@ function Invoke-Ego {
         try { $line = $readTask.Result } catch { $line = $null }
         if ($null -eq $line) { break }   # 输出流结束
         [void]$stdout.AppendLine($line)
-        Write-Host $line
+        if ($line.StartsWith('FORM_TITLE=')) { $script:FormTitle = $line.Substring('FORM_TITLE='.Length) }
+        Write-Log $line
     }
 
     $proc.WaitForExit()
@@ -274,7 +276,7 @@ function Get-AiCopy {
 {"title":"...","description":"...","tags":["...","..."]}
 
 要求：
-- title：16 个字以内（这是"短标题"字段，限制 16 字），口语化、有观点或悬念，能让人想点开；尽量纯中文、不要英文；不要引号，不要话题标签，不要句号
+- title：16 个字以内（这是"短标题"字段，限制 16 字），口语化、有观点或悬念，能让人想点开；尽量纯中文，停顿用空格，不要逗号、句号、引号或话题标签
 - description：2 到 4 句话，80 到 180 字，概括核心观点，结尾留一个能引发讨论或共鸣的钩子；纯文本，不要 HTML，不要话题标签
 - tags：3 到 5 个，每个 2 到 6 个汉字，不带 # 号
 - 全部使用简体中文；不要编造转写文本里没有的事实或数字
@@ -551,6 +553,7 @@ try {
         Write-Log '开始通过 ego 浏览器上传并发表（大文件需要几分钟，请稍等）……' Cyan
     }
     $egoResult = Invoke-Ego -TimeoutMs 1500000 -ScriptUrl ($EgoScriptUrl + '?input=' + [Uri]::EscapeDataString($EgoInputPath))
+    if ($null -ne $script:FormTitle) { $copy.Title = $script:FormTitle }
     [System.IO.File]::WriteAllText((Join-Path $runDir 'ego-result.txt'), $egoResult, $Utf8NoBom)
     Write-Log ('ego 结果：{0}' -f $egoResult) DarkGray
 
@@ -568,9 +571,11 @@ try {
     $ok = $false
     switch -Regex ($egoResult) {
         '^RESULT=OK' { Write-Host '  状态  ：发布成功 ✅' -ForegroundColor Green; $ok = $true; break }
-        '^RESULT=NO_PUBLISH' { Write-Host '  状态  ：测试模式，未发表' -ForegroundColor Yellow; $ok = $true; break }
+        '^RESULT=NO_PUBLISH' { Write-Host '  状态  ：预演完成，发表按钮可用，未点击' -ForegroundColor Yellow; $ok = $true; break }
         '^RESULT=NEED_LOGIN' { Write-Host '  状态  ：需要扫码登录' -ForegroundColor Yellow; break }
-        '^RESULT=UNCONFIRMED' { Write-Host '  状态  ：已提交，结果未确认' -ForegroundColor Yellow; break }
+        '^RESULT=NOT_CLICKED\s*(.*)' { Write-Host ('  状态  ：未点到发表。{0}' -f $Matches[1]) -ForegroundColor Red; break }
+        '^RESULT=CLICK_UNKNOWN' { Write-Host '  状态  ：无法确认点击是否送达，请在保留的 ego 页面核对' -ForegroundColor Yellow; break }
+        '^RESULT=UNCONFIRMED' { Write-Host '  状态  ：已点发表，平台结果未确认，请在 ego 中核对' -ForegroundColor Yellow; break }
         default { Write-Host ('  状态  ：失败 ❌  {0}' -f $egoResult) -ForegroundColor Red; break }
     }
 

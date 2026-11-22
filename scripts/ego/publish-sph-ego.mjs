@@ -2,7 +2,8 @@
 // 由 scripts\oneclick-sph-ego.ps1 调用，不要手动运行。
 // 输入：本次发布目录的 ego-input.json，通过模块 URL 的 input 参数传入。
 //   { videoPath, title, desc, tags, noPublish }
-// 输出：最后一行固定打印 RESULT=OK / RESULT=FAIL / RESULT=NO_PUBLISH / RESULT=NEED_LOGIN
+// 输出：RESULT=... 供桌面入口区分表单失败、点击、平台回执与预演。
+import { declareOriginal, fillShortTitle, publishFromForm } from "./sph-publish-form.mjs";
 
 const fs = await import("node:fs/promises");
 const path = await import("node:path");
@@ -18,55 +19,6 @@ async function readInput() {
   return JSON.parse(raw);
 }
 
-async function cdpClick(page, x, y) {
-  await page.cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-  await page.cdp("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-  await page.cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-}
-
-// 在 wujie shadow DOM 里定位可见元素，滚进视口后用 CDP 真实点击。
-// kind: "button"(按文字精确匹配可见按钮) | "checkbox"(按容器开头文字匹配 .ant-checkbox)
-async function clickInShadow(page, kind, text) {
-  const findRect = (scroll) =>
-    page.evaluate(
-      ({ kind, text, scroll }) => {
-        const wujie = document.querySelector("wujie-app");
-        const sr = wujie && wujie.shadowRoot;
-        if (!sr) return null;
-        const vis = (b) => !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length);
-        let el = null;
-        if (kind === "button") {
-          for (const b of sr.querySelectorAll("button")) {
-            if ((b.innerText || b.textContent || "").trim() === text && vis(b) && !b.disabled && !b.className.includes("disabled")) {
-              el = b;
-              break;
-            }
-          }
-        } else if (kind === "checkbox") {
-          for (const e of sr.querySelectorAll("*")) {
-            if (e.textContent.trim().startsWith(text) && e.querySelector(".ant-checkbox")) {
-              el = e.querySelector(".ant-checkbox");
-              break;
-            }
-          }
-        }
-        if (!el) return null;
-        if (scroll) el.scrollIntoView({ block: "center", inline: "center" });
-        const r = el.getBoundingClientRect();
-        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-      },
-      { kind, text, scroll },
-    );
-
-  const r1 = await findRect(true);
-  if (!r1) return false;
-  await page.waitForTimeout(700);
-  const r2 = await findRect(false);
-  if (!r2) return false;
-  await cdpClick(page, r2.x, r2.y);
-  return true;
-}
-
 async function shadowText(page) {
   return page.evaluate(() => {
     const wujie = document.querySelector("wujie-app");
@@ -75,20 +27,16 @@ async function shadowText(page) {
   });
 }
 
-// 恢复 ego-lite 窗口（最小化时无法扫码/截图）
-async function restoreWindow(task) {
+async function showWindow(task, page) {
   try {
-    const tabs = await task.tabs();
-    const active = tabs.find((t) => t.active) || tabs[0];
-    if (active) {
-      const win = await task.cdp("Browser.getWindowForTarget", { targetId: active.targetId });
-      if (win && win.windowId) {
-        await task.cdp("Browser.setWindowBounds", { windowId: win.windowId, bounds: { windowState: "normal" } });
-      }
+    const win = await task.cdp("Browser.getWindowForTarget", { targetId: page.targetId });
+    if (win.bounds?.windowState === "minimized") {
+      await task.cdp("Browser.setWindowBounds", { windowId: win.windowId, bounds: { windowState: "normal" } });
     }
   } catch (e) {
-    /* 非关键 */
+    console.log("EGO_WINDOW " + e.message);
   }
+  await page.cdp("Page.bringToFront").catch(e => console.log("EGO_FOREGROUND " + e.message));
 }
 
 async function waitForShadowText(page, text, present, timeout) {
@@ -189,11 +137,13 @@ async function main() {
   // 每次用新空间名（时间戳）：ego 的新空间默认落在同一 profile（Profile 4），
   // 登录 cookie 在 profile 层跨空间共享，所以登录态能保留；同时避免固定空间名
   // 变成 user-owned 后触发 NAME_IN_USE 报错。
-  const SPACE = "sph-ego-" + Date.now();
+  const SPACE = "视频号一键发布-" + Date.now();
   const task = await taskSpace(SPACE);
   const page = task.page("p1");
-
+  let keepResult = false;
   try {
+    console.log("EGO_SPACE=" + task.spaceId + " " + SPACE);
+    await showWindow(task, page);
     // 1) 打开视频号助手，判断登录态
     await page.goto(ASSISTANT_HOME, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
     await page.waitForTimeout(3000);
@@ -202,7 +152,7 @@ async function main() {
     // 未登录 -> 需要扫码
     if (url.includes("/login") || url.includes("oauth-callback")) {
       console.log("[登录检测] 未登录，需要扫码：请在弹出的浏览器窗口里用微信扫码登录（最多等 5 分钟）");
-      await restoreWindow(task);
+      await showWindow(task, page);
       const deadline = Date.now() + 300000; // 最多等 5 分钟
       let loggedIn = false;
       while (Date.now() < deadline) {
@@ -248,13 +198,7 @@ async function main() {
     // 5) 短标题（上限 16 字，兜底截断）
     // “取消上传”消失只代表字节传完，不代表表单已渲染；大视频转码/出封面更慢，
     // 固定 sleep 猜时长会在这步超时。改成按真实条件等待：短标题输入框可见后再填。
-    const TITLE_SELECTOR = 'input[placeholder="填写短标题有机会获得更多流量"]';
-    const title = (input.title || "").trim().slice(0, 16);
-    if (title) {
-      await page.waitForSelector(TITLE_SELECTOR, { state: "visible", timeout: 900000 });
-      await page.fill(TITLE_SELECTOR, title);
-      console.log("TITLE_FILLED");
-    }
+    input.title = await fillShortTitle(page, input.title);
 
     // 6) 视频描述 + 标签（contenteditable）
     const desc = (input.desc || "").trim();
@@ -267,84 +211,31 @@ async function main() {
       console.log("DESC_FILLED");
     }
 
-    // 7) 声明原创（按配置决定）：勾选表单复选框
+    // 7) 核实原创声明，再检查最终表单是否可发表。
     if (input.declareOriginal !== false) {
-      const declared = await page.evaluate(() => {
-        const wujie = document.querySelector("wujie-app");
-        const sr = wujie && wujie.shadowRoot;
-        if (!sr) return null;
-        for (const el of sr.querySelectorAll("*")) {
-          if (el.textContent.includes("声明后，作品将展示原创标记") && el.querySelector(".ant-checkbox-input")) {
-            return el.querySelector(".ant-checkbox-input").checked;
-          }
-        }
-        return null;
-      });
-      if (declared === false) {
-        const ok = await clickInShadow(page, "checkbox", "声明后，作品将展示原创标记");
-        console.log(ok ? "DECLARE_CHECKED" : "DECLARE_CHECK_FAILED");
-        await page.waitForTimeout(1500);
-      } else if (declared === true) {
-        console.log("DECLARE_ALREADY_CHECKED");
-      }
-
-      // 8) 处理“原创权益”弹窗
-      const t1 = await shadowText(page);
-      if (t1.includes("原创权益")) {
-        await clickInShadow(page, "checkbox", "我已阅读并同意");
-        await page.waitForTimeout(1200);
-        await clickInShadow(page, "button", "声明原创");
-        await page.waitForTimeout(2000);
-        console.log("DECLARE_CONFIRMED");
-      } else {
-        console.log("NO_DECLARE_DIALOG");
-      }
+      await declareOriginal(page);
     } else {
       console.log("SKIP_DECLARE");
     }
 
-    // 9) 测试模式：填好即止，不发表
-    if (input.noPublish) {
-      console.log("RESULT=NO_PUBLISH");
-      return; // 不 finish，留着浏览器给用户检查
-    }
-
-    // 10) 发表
-    const clicked = await clickInShadow(page, "button", "发表");
-    console.log(clicked ? "PUBLISH_CLICKED" : "PUBLISH_BTN_NOT_FOUND");
-
-    // 11) 核实
-    await page.waitForTimeout(5000);
-    url = await page.url();
-    let published = false;
-    if (url.includes("/post/list")) {
-      published = true;
-    } else {
-      const t2 = await shadowText(page);
-      if (t2.includes("已发表")) {
-        published = true;
-      }
-    }
-
-    if (published) {
+    const result = await publishFromForm(page, input.noPublish);
+    keepResult = result === "RESULT=OK" || result === "RESULT=NO_PUBLISH";
+    if (result === "RESULT=OK") {
       // 12) 数据半环：抓取刚发布作品的标识（非致命，失败不影响发布结果）
       try {
         await captureRetro(page, input);
       } catch (e) {
         console.log("RETRO_CAPTURE_SKIP " + (e && e.message ? e.message : String(e)));
       }
-      console.log("RESULT=OK");
-    } else {
-      console.log("RESULT=UNCONFIRMED url=" + url);
     }
+    console.log(result);
   } catch (e) {
-    console.log("RESULT=FAIL " + (e && e.message ? e.message : String(e)));
+    console.log("RESULT=NOT_CLICKED " + String(e.message || e).split("\n")[0]);
   } finally {
-    // 登录态靠 profile 层 cookie 保留（跨空间共享），不依赖空间本身，
-    // 所以正常 finish 关闭本次空间即可，登录态仍然在。
-    if (!input.noPublish) {
-      try { await task.finish({ keep: [] }); } catch (e) {}
-    }
+    try {
+      if (keepResult) await task.finish({ keep: [page.label] });
+      else await task.handOff();
+    } catch (e) { console.log("EGO_SPACE " + String(e.message || e).split("\n")[0]); }
   }
 }
 
