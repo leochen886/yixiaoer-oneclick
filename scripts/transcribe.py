@@ -5,7 +5,8 @@ import wave
 
 import numpy as np
 
-def transcribe(audio_path, model_dir, model_source="small", *, offline=False):
+
+def open_recognizer(audio_path, model_dir, model_source="small", *, offline=False):
     if not offline:
         os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -19,11 +20,20 @@ def transcribe(audio_path, model_dir, model_source="small", *, offline=False):
     model = WhisperModel(model_source, device="cpu", compute_type="int8",
                          download_root=str(model_dir), local_files_only=offline)
     options = {"condition_on_previous_text": False, "initial_prompt": "以下是简体中文口播的逐字记录。"} if offline else {}
-    segments, info = model.transcribe(audio, language="zh", beam_size=5, vad_filter=True, **options)
-    return {"language": info.language, "duration": info.duration, "segments": [
-        {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
-        for s in segments
-    ]}
+
+    def recognize(start=0.0, end=None):
+        stop = len(audio) if end is None else min(len(audio), round(end * 16000))
+        first = max(0, round(start * 16000))
+        segments, info = model.transcribe(audio[first:stop], language="zh", beam_size=5,
+                                          vad_filter=end is None, **options)
+        return {"language": info.language, "duration": info.duration, "segments": [
+            {"start": round(first / 16000 + s.start, 2), "end": round(first / 16000 + s.end, 2),
+             "text": s.text.strip()} for s in segments]}
+    return recognize
+
+
+def transcribe(audio_path, model_dir, model_source="small", *, offline=False):
+    return open_recognizer(audio_path, model_dir, model_source, offline=offline)()
 
 
 if __name__ == "__main__":

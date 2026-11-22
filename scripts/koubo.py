@@ -1,4 +1,4 @@
-"""本地口播粗剪。可直接运行，也可把视频拖到「剪口播.cmd」。"""
+"""DeepSeek 听写原声音轨并分析全文，在本地剪辑、烧录字幕和导出。"""
 
 import argparse
 import hashlib
@@ -7,14 +7,15 @@ import math
 import os
 import subprocess
 import tempfile
-from dataclasses import replace
+from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
 
-from koubo_plan import (align_reviewed_words, caption_events, make_plan, map_kept_words,
+from koubo_deepseek import build_cut_plan
+from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
                         quiet_ranges, read_words, review_groups)
-from koubo_proofread import MODEL, project_reference, read_reference, review_captions, transcribe_deepseek
-from transcribe import transcribe as whisper_transcribe
+from koubo_proofread import read_reference, review_captions
+from transcribe import open_recognizer
 from transcribe_funasr import transcribe
 
 
@@ -93,22 +94,97 @@ def render(source, work, video_index, fps, keep, output_frames):
                    cwd=work, check=True)
 
 
-def export(source, root, min_pause, local_subtitles=False, asr_reference=None, deepseek_audio=False):
+def prepare_source_edits(source, work, duration, rate, min_pause, local_subtitles, asr_reference):
+    receipt = read_reference(asr_reference, source)
+    wav = work / "audio.wav"
+    print("正在本地转写口播…", flush=True)
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(source),
+                    "-map", "0:a:0", "-af", "aresample=16000:async=1:first_pts=0",
+                    "-t", str(duration), "-ac", "1", "-c:a", "pcm_s16le", str(wav)], check=True)
+    words = read_words(transcribe(wav, offline=True))
+    quiet = quiet_ranges(wav)
+    proof = {"model": None}
+    if not local_subtitles:
+        events = review_groups(words, limit=14)
+        reference = []
+        listen_again = None
+        cache = Path(__file__).resolve().parents[1] / "koubo" / "models"
+        snapshot = next(cache.glob("models--Systran--faster-whisper-small/snapshots/*/model.bin"), None)
+        if snapshot:
+            print("正在用本机 Whisper 复听原声…", flush=True)
+            try:
+                recognize = open_recognizer(wav, cache, str(snapshot.parent), offline=True)
+                reference = recognize()["segments"]
+
+                def listen_again(start, end):
+                    window = recognize(max(0, start - .25), min(duration, end + .25))
+                    reading = "".join(s["text"] for s in window["segments"]).strip()
+                    return [reading] if reading else []
+            except (ImportError, OSError, RuntimeError) as exc:
+                print(f"本地复听未完成（{type(exc).__name__}），继续校对现有转写。", flush=True)
+        print("正在使用 DeepSeek 校对原速逐字稿，疑处在本机按原声复听…", flush=True)
+        events, proof = review_captions(events, reference, receipt,
+                                        receipt.get("local_spot_checks", []),
+                                        receipt.get("asr_spot_checks", []),
+                                        listen_again=listen_again)
+        proof["reference_asr"] = "faster-whisper-small" if reference else None
+        print(f"字幕校对：输入 {proof['prompt_tokens']}、输出 {proof['completion_tokens']} tokens。", flush=True)
+        words = align_reviewed_words(words, events)
+        if "".join("".join(w.text.split()) for w in words) != "".join(
+                "".join(e["text"].split()) for e in events):
+            raise ValueError("原速校对稿与时间锚点不一致，已停止导出。")
+    decisions = []
+    print("正在按原速逐字稿标记口误和长停顿…", flush=True)
+    keep, dropped, edits = make_plan(words, quiet, duration, rate, min_pause, decisions=decisions)
+    return words, proof, decisions, keep, dropped, edits
+
+
+def restore_source_edits(source, duration, rate, report_path, restore_ids):
+    saved = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    if (saved.get("source") != source.name or saved.get("fps") != str(rate)
+            or abs(saved.get("duration", 0) - duration) > 0.001
+            or saved.get("source_size", source.stat().st_size) != source.stat().st_size
+            or "source_words" not in saved or "cut_decisions" not in saved):
+        raise ValueError("剪辑记录与原片不符，或没有保存可恢复的原片剪点。")
+    words = [Word(**item) for item in saved["source_words"]]
+    active = [d for d in saved["cut_decisions"] if not d.get("restored")]
+    unknown = set(restore_ids) - {d["id"] for d in active}
+    if unknown:
+        raise ValueError("剪辑记录中找不到可恢复的剪点：" + "、".join(sorted(unknown)))
+    for d in active:
+        if d["id"] in restore_ids:
+            d["restored"] = True
+    remaining = [d for d in active if not d.get("restored")]
+    keep = kept_ranges(round(duration * float(rate)), [d["frames"] for d in remaining])
+    dropped, edits = set(), []
+    for d in remaining:
+        if d["first_word"] is not None:
+            first, last = d["first_word"], d["last_word"]
+            dropped.update(range(first, last+1))
+            edits.append({"reason": d["reason"], "text": "".join(w.text for w in words[first:last+1]),
+                          "start": d["source_start"], "end": d["source_end"]})
+    return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits
+
+
+def export(source, root, min_pause, local_subtitles=False, asr_reference=None, deepseek_audio=None,
+           cut_report=None, restore_ids=()):
     if not math.isfinite(min_pause) or min_pause <= 0:
         raise ValueError("停顿阈值必须大于零。")
     idx, duration, rate, columns = probe(source, with_columns=True)
-    receipt = read_reference(asr_reference, source)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
         work = Path(temp)
-        wav = work / "audio.wav"
-        print("正在本地转写口播…", flush=True)
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(source),
-                        "-map", "0:a:0", "-af", "aresample=16000:async=1:first_pts=0",
-                        "-t", str(duration), "-ac", "1", "-c:a", "pcm_s16le", str(wav)], check=True)
-        words = read_words(transcribe(wav, offline=True))
-        quiet = quiet_ranges(wav)
-        keep, dropped, edits = make_plan(words, quiet, duration, rate, min_pause)
+        if cut_report:
+            words, proof, decisions, keep, dropped, edits = restore_source_edits(
+                source, duration, rate, cut_report, restore_ids)
+        elif local_subtitles or asr_reference or deepseek_audio is False:
+            words, proof, decisions, keep, dropped, edits = prepare_source_edits(
+                source, work, duration, rate, min_pause, local_subtitles, asr_reference)
+        else:
+            plan = build_cut_plan(source, work / "原声记录", duration, rate,
+                                  send_audio=True, min_pause=min_pause)
+            words, proof, decisions, keep, dropped, edits = restore_source_edits(
+                source, duration, rate, plan, ())
         retained = map_kept_words(words, dropped, keep, float(rate))
         kept_frames = sum(b - a for a, b in keep)
         output_frames = max(1, round(kept_frames / SPEED))
@@ -116,45 +192,18 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         timed = [replace(w, start=min(w.start / float(SPEED), out_seconds),
                          end=min(w.end / float(SPEED), out_seconds)) for w in retained]
         timed = [w for w in timed if w.start < w.end]
-        proof = {"model": None}
-        if not local_subtitles:
-            events = review_groups(retained, limit=min(14, columns))
-            for event in events:
-                event["start"] = min(event["start"] / float(SPEED), out_seconds)
-                event["end"] = min(event["end"] / float(SPEED), out_seconds)
-            events = [e for e in events if round(e["end"]*1000) > round(e["start"]*1000)]
-            seconds = [(float(a/rate), float(b/rate)) for a, b in keep]
-            def on_output(segments):
-                result = project_reference(segments, seconds)
-                for row in result:
-                    row["start"] = min(row["start"] / float(SPEED), out_seconds)
-                    row["end"] = min(row["end"] / float(SPEED), out_seconds)
-                return [s for s in result if round(s["end"]*1000) > round(s["start"]*1000)]
-            reference = []
-            cache = Path(__file__).resolve().parents[1] / "koubo" / "models"
-            snapshot = next(cache.glob("models--Systran--faster-whisper-small/snapshots/*/model.bin"), None)
-            if snapshot:
-                print("正在用本机 Whisper 复听原声…", flush=True)
-                try:
-                    reference = on_output(whisper_transcribe(wav, cache, str(snapshot.parent), offline=True)["segments"])
-                except (ImportError, OSError, RuntimeError) as exc:
-                    print(f"本地复听未完成（{type(exc).__name__}），继续校对现有转写。", flush=True)
-            if deepseek_audio:
-                print("正在使用 DeepSeek 识别本次指定的原片音轨…", flush=True)
-                receipt = transcribe_deepseek(wav, quiet)
-            print("正在使用 DeepSeek 逐条核对成片字幕…", flush=True)
-            events, proof = review_captions(events, reference, receipt,
-                                            on_output(receipt.get("local_spot_checks", [])),
-                                            on_output(receipt.get("asr_spot_checks", [])),
-                                            model=MODEL if deepseek_audio else None)
-            if deepseek_audio:
-                proof["audio_asr"] = receipt["chunks"]
-            proof["reference_asr"] = "faster-whisper-small" if reference else None
-            print(f"字幕校对：输入 {proof['prompt_tokens']}、输出 {proof['completion_tokens']} tokens。", flush=True)
-            timed = align_reviewed_words(timed, events)
+        def output_time(t):
+            frames = sum(max(0, min(t * float(rate), b) - a) for a, b in keep)
+            return round(min(out_seconds, frames / float(rate) / float(SPEED)), 3)
+        for group in ("rows", "edits", "unconfirmed", "unmatched"):
+            for entry in proof.get(group, []):
+                entry.setdefault("source_time", entry["output_time"])
+                entry["output_time"] = output_time(entry["source_time"])
+        for decision in decisions:
+            decision["output_time"] = output_time(decision["source_start"])
         events = caption_events(timed, limit=columns, wrap=True)
         write_srt(work / "captions.srt", events)
-        proof["input_mode"] = "explicit_reference" if asr_reference else "source_video_only"
+        proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
         render(source, work, idx, rate, keep, output_frames)
@@ -164,10 +213,15 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         package.mkdir()
         (work / "render.mp4").rename(package / (name + ".mp4"))
         (work / "captions.srt").rename(package / (name + ".srt"))
-        report = {"source": source.name, "duration": duration, "output_duration": out_seconds,
+        report = {"source": source.name, "source_size": source.stat().st_size,
+                  "duration": duration, "output_duration": out_seconds,
                   "fps": str(rate), "keep": [[float(a/rate), float(b/rate)] for a, b in keep],
-                  "word_edits": edits, "speed": float(SPEED),
+                  "word_edits": edits, "speed": float(SPEED), "cut_decisions": decisions,
+                  "source_words": [asdict(w) for w in words],
                   "cut_duration": float(kept_frames / rate), "proofreading": proof, "display_cues": events}
+        if cut_report:
+            report["replay"] = {"cut_report_sha256": hashlib.sha256(cut_report.read_bytes()).hexdigest(),
+                                "restored_cut_ids": list(restore_ids)}
         (package / "剪辑记录.json").write_text(json.dumps(report, ensure_ascii=False, indent=2),
                                                 encoding="utf-8")
         # Publish the completed set together. A repeat run receives its own folder.
@@ -219,11 +273,17 @@ def main():
     parser.add_argument("--min-pause", type=float, default=0.35, help="开始检查停顿的秒数（默认 0.35）")
     parser.add_argument("--open-folder", action="store_true", help="完成后在资源管理器中打开成片目录")
     parser.add_argument("--publish-path-file", type=Path, help="为发布入口准备视频，并写回本次成片的绝对路径")
+    parser.add_argument("--cut-report", type=Path, help="沿用原片的剪点与自动校对稿，在本机重新导出")
+    parser.add_argument("--restore-cut", action="append", default=[], help="恢复指定剪点 ID，可重复使用")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--local-subtitles", action="store_true", help="离线导出，使用本地转写字幕")
     inputs.add_argument("--asr-reference", type=Path, help="读取与本片绑定的本地原声听写记录")
-    inputs.add_argument("--deepseek-audio", action="store_true", help="仅为本次原片发送音轨给 DeepSeek 识别")
+    inputs.add_argument("--deepseek-audio", action="store_true", default=None,
+                        help="使用默认的 DeepSeek 原声听写流程")
     args = parser.parse_args()
+    if (args.restore_cut and not args.cut_report) or (args.cut_report and
+            (args.local_subtitles or args.asr_reference or args.deepseek_audio or args.publish_path_file)):
+        parser.error("--restore-cut 需要 --cut-report。使用剪辑记录时只支持本地重导出。")
     try:
         source = args.video.absolute()
         if args.publish_path_file and is_exported_video(source):
@@ -232,7 +292,8 @@ def main():
             print("已核对成片和同名字幕，直接使用所选版本。")
         else:
             destination = export(source, args.output_dir.absolute(), args.min_pause,
-                                 args.local_subtitles, args.asr_reference, args.deepseek_audio)
+                                 args.local_subtitles, args.asr_reference, args.deepseek_audio,
+                                 args.cut_report, args.restore_cut)
             video = destination / (source.stem + "_cut.mp4")
             if args.publish_path_file and not is_exported_video(video):
                 raise ValueError("导出的成片未通过核对，已停止准备发布。")

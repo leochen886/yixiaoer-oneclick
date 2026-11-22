@@ -23,21 +23,27 @@
 | Python 3.10+ | 本地语音转写 | 使用 FunASR（离线）或 faster-whisper |
 | Claude Code CLI（`claude`） | 生成标题 / 描述 / 标签 | 需可用的 Claude 账号 |
 
-> 说明：转写走**本地模型**，不联网、不上传音视频；AI 文案生成走本机 `claude` 命令。
+> 默认剪口播会把所选原片的音轨发给 DeepSeek 官方语音识别，再把听写全文、字词位置和候选停顿发给 DeepSeek Flash。画面在本机剪辑和导出。发布文案使用本机 `claude` 命令生成。
 
 ---
 
 ## 剪口播 SOP
 
-把一条带声音的口播视频拖到 `剪口播.cmd`。程序在本机识别语音、剪掉长停顿，固定以 **1.3 倍速**导出，保持人声音调。烧入画面的中文字幕与同名 SRT 共用加速后的时间轴。完成后自动打开 `output/<原名>_cut/`，里面有 MP4、SRT 和 `剪辑记录.json`。重复导出会另外建目录。
+把原片拖到 `剪口播.cmd` 可以单独剪辑并预览。桌面「视频号一键发布」处理原片时使用同一套默认流程。成片、同名 SRT 和 `剪辑记录.json` 保存在 `output/<原名>_cut/`。重复导出会另外建目录。
 
-默认从 0.35 秒的词间停顿开始检查，只压缩经波形确认的安静部分。独立语气词、连续三次以上的人称代词卡顿，以及停下来重新说了一遍的相同短开头，需要有安静切点才会删除。“然后、其实、就是、这个、那个”默认保留。
+1. 按原速提取音轨，发送给 DeepSeek ASR，按原片顺序拼成听写全文。本机用 FunASR 获取字词时间，并从波形测出连续安静区间。
+2. DeepSeek Flash 读取全文和原声位置，校正有依据的错词，标出重说的前后两遍、需要缩短的气口和希望保留的停顿长度。
+3. 程序把标记对回原片。重说要能定位两遍发音，并在前一遍两端找到合适的剪点才会删除。气口只缩短连续安静的部分。模型建议和实际执行结果均写入记录。
+4. 画面和声音共用同一张原片剪点表，固定以 **1.3 倍速**导出，保留人声音调。记录中的 `cut_decisions` 列出每一刀的原因、原片起止、剪点 ID 和成片位置。
+5. 把保留词的时间换算到成片上，按语意和停顿换幕，优先单行，保护完整词和称呼。较长分句可在同一幕换行。MP4 烧录的字幕和同名 SRT 使用同一份排版。
 
-字幕默认单行，按加速后的原声词时间戳换幕。分幕优先选在说完一个意思或问答交接的位置，保留完整的词和称呼。长句找不到合适的换幕位置时，同一幕可以显示两行。DeepSeek Flash 结合上下文校字，日常导出只发送文字。项目内已有 Whisper small 模型时，会在本机复听原声，给每条字幕附上同时段的听写。程序用拼音核验同音改字，新环境可用 `python -m pip install pypinyin==0.55.0` 安装此依赖。
+用 `--cut-report` 可以沿用已校对的原速逐字稿和剪点，在本机重新排版导出。要恢复某一刀，先在记录里找到该剪点的 `id`，再加上 `--restore-cut`。可以一次恢复多刀。
 
-需要 DeepSeek 直接听某条已授权的音轨时，运行 `python -X utf8 scripts/koubo.py "视频路径" --deepseek-audio`。程序从原片提取声音，调用 DeepSeek 语音识别，再调用 Flash 校对。此选项仅对当次导出生效。语音识别的原文和请求编号保存在剪辑记录的 `proofreading.audio_asr`。
+```powershell
+python -X utf8 scripts/koubo.py "原片.mp4" --cut-report "成片目录/剪辑记录.json" --restore-cut "起始帧-结束帧"
+```
 
-测试自动流程时只拖入原片。验收以新目录里的成片和同名 SRT 为准。打开 `剪辑记录.json`，`proofreading.input_mode` 为 `source_video_only` 表示输入只有原片，`request_ids` 是 DeepSeek 返回的调用编号。每行的 `before`、`after`、`exported` 分别是本地底稿、DeepSeek 的答复和烧入成片的文字。已知正确的台词只在导出后比对。
+默认导出在剪辑记录中标为 `proofreading.input_mode = deepseek_audio_first`。`audio_asr` 保存各段原声听写及其请求编号，`request_ids` 保存 Flash 的请求编号。`correction_audit` 和 `cut_audit` 分别记录校字、重说与气口的处理结果。`display_cues` 和同名 SRT 给出成片的字幕与播放时间。
 
 如果手头已有与该原片绑定的原声听写记录，可用 `--asr-reference <本片核对依据.json>` 做专项复核。程序核对原片的 SHA-256，在本机对齐听写和剪点，再用 DeepSeek Pro 核对字幕文字。这个选项只读取已有记录。若单独复听某条原声音轨，可将该片段的原片时间及听写结果随记录一起用于校对。
 
@@ -68,7 +74,11 @@ python -X utf8 scripts/koubo.py "D:\视频\原片.mp4" --min-pause 0.6
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\oneclick-sph-ego.ps1 -CutKoubo "D:\视频\xxx.mp4"
 ```
 
-仅在本地准备成片、查看将要上传的文件，可使用 `-PrepareOnly`。程序在打开视频号前结束，运行目录里的 `ego-input.json` 记录所选成片路径。
+从正式入口导出成片并停在上传前，可以运行下面的命令。此模式照常调用 DeepSeek，完成后在打开视频号前退出。运行目录里的 `prepared-video.txt` 记录实际成片路径。
+
+```powershell
+& ".\视频号一键发布.cmd" -PrepareOnly "D:\视频\原片.mp4"
+```
 
 需要测试上传和填表但不正式发表，可使用以下命令。
 

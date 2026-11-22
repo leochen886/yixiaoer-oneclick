@@ -19,6 +19,7 @@ import requests
 
 MODEL = "deepseek-flash"
 ENDPOINT = "https://api.deepseek.com/chat/completions"
+PROTECTED_FACTS = r"[\d零〇一二两三四五六七八九十百千万亿%％不没无未非]"
 PROMPT = """你是中文口播字幕听校员。字幕行和斜线是显示边界。先接起相邻行，连读一句完整的话。读起来通顺、与听写相符的直接保留。
 每行依次为编号、待校稿、本地底稿、同期本地听写、原声片段复听。只对听起来别扭的搭配作简短判断：把同音或近音的常用说法（包括口语俗称）代回整句话，看说的是谁或什么、前后搭配是否自然、下一句能否接上。仅仅与话题相关不够。若有一种说法既合读音又明显更通顺，即使各份听写都没写出来，也应改正。只输出逐行结果。
 保留原话的意思、说话习惯、实际说出的重复、数字和否定。不要润色或删除口吃。不同编号对应不同发音时间，不要移动正常台词，不要在相邻行把词拆开。
@@ -222,12 +223,11 @@ def align_hearing(events, hearing):
 
 def compatible(old, new, nearby, hearing):
     """Numbers and polarity may change only with independent speech evidence."""
-    protected = r"[\d零〇一二两三四五六七八九十百千万亿%％不没无未非]"
     normalized = plain(new)
     local = plain(nearby)
     if re.findall("[不没无未非]", old) != re.findall("[不没无未非]", new):
         return False
-    if re.findall(protected, plain(old)) != re.findall(protected, normalized):
+    if re.findall(PROTECTED_FACTS, plain(old)) != re.findall(PROTECTED_FACTS, normalized):
         if normalized in local and normalized in hearing:
             return True
         numbers = re.findall(r"\d+(?:\.\d+)?%?", new)
@@ -270,7 +270,50 @@ def compatible(old, new, nearby, hearing):
     return True
 
 
-def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_checks=(), model=None):
+def review_tokens(text):
+    """Keep written numbers and mixed-case Latin terms intact when comparing ASR readings."""
+    import jieba
+    protected = r"[A-Za-z][A-Za-z0-9]*(?:[ .-][A-Za-z][A-Za-z0-9]*)*|\d+(?:[.,]\d+)*[%％]?|[零〇一二两三四五六七八九十百千万亿]+"
+    tokens = []
+    end = 0
+    for match in re.finditer(protected, text):
+        tokens.extend(jieba.lcut(text[end:match.start()]))
+        tokens.append(match[0])
+        end = match.end()
+    tokens.extend(jieba.lcut(text[end:]))
+    return tokens
+
+
+def apply_review_edits(draft, proposed, status, nearby, hearing):
+    """Decide each independently aligned word/phrase against the original acoustic context."""
+    if status != "改" or proposed == draft or not proposed:
+        return draft, []
+    if any(not c.isprintable() or c in "<>{}\\" for c in proposed):
+        return draft, []
+    old, new = review_tokens(draft), review_tokens(proposed)
+    # If an independent transcript already contains the complete proposed phrase,
+    # its unchanged neighbours can corroborate a deletion as well as a substitution.
+    reading = plain(proposed)
+    corroborated = (bool(reading) and (reading in plain(nearby) or reading in plain(hearing))
+                    and compatible(draft, proposed, nearby, hearing))
+    parts, decisions = [], []
+    for op, a, b, c, d in SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        before, after = "".join(old[a:b]), "".join(new[c:d])
+        if op == "equal":
+            parts.append(before)
+            continue
+        prefix, suffix = "".join(old[:a]), "".join(old[b:])
+        candidate = prefix + after + suffix
+        same_facts = re.findall(PROTECTED_FACTS, plain(before)) == re.findall(PROTECTED_FACTS, plain(after))
+        accepted = (bool(candidate.strip()) and len(after) <= max(len(before) + 6, 18)
+                    and ((corroborated and same_facts) or compatible(draft, candidate, nearby, hearing)))
+        parts.append(after if accepted else before)
+        decisions.append({"start": len(prefix), "before": before, "after": after, "accepted": accepted})
+    return "".join(parts), decisions
+
+
+def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_checks=(), model=None,
+                    listen_again=None):
     receipt = receipt or {}
     hearing = receipt.get("text", "")
     key = api_key()
@@ -294,6 +337,7 @@ def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_ch
         for field in ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens"):
             report[field] += int(usage.get(field, 0))
 
+    full_text = " / ".join(e["text"] for e in events)
     batches = deque((start, min(start+32, len(events)), 0) for start in range(0, len(events), 32))
     while batches:
         start, end, retries = batches.popleft()
@@ -327,6 +371,12 @@ def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_ch
                    "另一份连续听写": " / ".join(s["text"] for s in reference
                        if s["end"] > context[0]["start"] and s["start"] < context[-1]["end"]),
                    "字幕行（编号、待校稿、本地底稿、同期本地听写、原声片段复听）": inputs}
+        if len(full_text) <= 16000:
+            content["全片原速转写（核对跨段术语，不能仅按话题猜词）"] = full_text
+        else:
+            # Preserve cross-batch spellings without exceeding the model's context.
+            terms = re.findall(r"[A-Za-z][A-Za-z0-9]*(?: +[A-Za-z][A-Za-z0-9]*)*", full_text)
+            content["全片转写已出现的英文写法"] = list(dict.fromkeys(terms))[:256]
         if hearing:
             content["本条视频的原声听写（含未剪原片内容）"] = hearing
         try:
@@ -367,18 +417,22 @@ def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_ch
                       "output_time": round(event["start"], 3)}
             if hearing and not spans[idx-1]:
                 report["unmatched"].append({"cue": idx, "text": old, "output_time": change["output_time"]})
-            if (status == "改" and draft != new and new and len(new) <= max(len(draft) + 6, 18)
-                    and all(c.isprintable() and c not in "<>{}\\" for c in new)
-                    and compatible(draft, new, local_text, hearing_text)):
-                final = new
-            else:
-                final = draft
-                if status == "疑" or draft != new:
-                    report["unconfirmed"].append(change)
+            final, decisions = apply_review_edits(draft, new, status, local_text, hearing_text)
+            readings = []
+            if listen_again and (status == "疑" or any(not d["accepted"] or
+                    re.search("[a-zA-Z]", d["before"] + d["after"]) for d in decisions)):
+                # Only the acoustic window is supplied to the recognizer.
+                readings = listen_again(event["start"], event["end"])
+                if readings:
+                    final, decisions = apply_review_edits(draft, new, status,
+                                "。".join([*local, *(acoustic if not hearing else []), *readings]), hearing_text)
+            if status == "疑" or final != new:
+                report["unconfirmed"].append({**change, "exported": final})
             checked.append({**event, "text": final})
             if final != old:
                 report["edits"].append({**change, "after": final})
             report["rows"].append({**change, "local_readings": local, "clip_readings": acoustic,
-                                   "model_status": status, "exported": final})
+                                   "blind_readings": readings, "model_status": status,
+                                   "exported": final, "word_decisions": decisions})
         report["checked_cues"] += len(rows)
     return checked, report

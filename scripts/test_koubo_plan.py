@@ -4,12 +4,15 @@ import json
 import tempfile
 import unittest
 import wave
+from dataclasses import asdict
+from fractions import Fraction
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from requests.exceptions import ChunkedEncodingError
-from koubo import is_exported_video
+from koubo import export, is_exported_video, main as cut_main, restore_source_edits
+from koubo_deepseek import apply_corrections, clock_transcript, resolve_span
 from koubo_plan import align_reviewed_words, caption_events, make_events, make_plan, read_words, wrap_caption
-from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, compatible, project_reference, review_captions, transcribe_deepseek
+from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
 
 
 def words(text, spans):
@@ -17,6 +20,133 @@ def words(text, spans):
 
 
 class CutPlanTests(unittest.TestCase):
+    def test_offline_or_explicit_reference_does_not_send_the_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "sample.mp4"
+            with patch("koubo.probe", return_value=(0, 2.0, Fraction(30), 16)), \
+                    patch("koubo.build_cut_plan") as cloud, \
+                    patch("koubo.prepare_source_edits", side_effect=ValueError("local path")) as local:
+                for mode in ({"local_subtitles": True}, {"asr_reference": root / "reference.json"}):
+                    with self.assertRaisesRegex(ValueError, "local path"):
+                        export(source, root, .35, **mode)
+                self.assertEqual(local.call_count, 2)
+                cloud.assert_not_called()
+
+    def test_both_entry_points_use_cloud_first_and_existing_export_is_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "sample.mp4"
+            source.touch()
+            path_file = root / "prepared-video.txt"
+            rate = Fraction(30)
+
+            def probe_video(video, *, with_columns=False):
+                result = (0, 2.6 if video == source else 2.0, rate)
+                return (*result, 16) if with_columns else result
+
+            def mock_plan(video, records, duration, rate, *, send_audio, min_pause):
+                self.assertEqual(video, source)
+                self.assertTrue(send_audio)
+                self.assertEqual(min_pause, .35)
+                records.mkdir()
+                record = records / "plan.json"
+                record.write_text(json.dumps({"source":video.name, "fps":str(rate), "duration":duration,
+                    "cut_decisions":[], "source_words":[asdict(w) for w in words("早", [[0,260]])],
+                    "proofreading":{"input_mode":"deepseek_audio_first"}}), encoding="utf-8")
+                return record
+
+            def mock_render(video, work, index, fps, keep, frames):
+                self.assertEqual((keep, frames), ([[0,78]], 60))
+                (work / "render.mp4").touch()
+
+            with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
+                    patch("koubo.build_cut_plan", side_effect=mock_plan) as build:
+                for extra in ([], ["--publish-path-file",str(path_file)]):
+                    with patch("sys.argv", ["koubo.py",str(source),"--output-dir",str(root),*extra]):
+                        destination = cut_main()
+                    report = json.loads((destination / "剪辑记录.json").read_text(encoding="utf-8"))
+                    self.assertEqual(report["speed"], 1.3)
+                    self.assertEqual(report["proofreading"]["input_mode"], "deepseek_audio_first")
+                    self.assertNotIn("replay", report)
+                prepared = Path(path_file.read_text(encoding="utf-8"))
+                self.assertEqual(prepared.parent, destination)
+                with patch("sys.argv", ["koubo.py", str(prepared), "--publish-path-file", str(path_file)]):
+                    self.assertEqual(cut_main(), destination)
+                self.assertEqual(build.call_count, 2)
+
+    def test_cloud_transcript_collapsed_restart_anchors_to_the_retained_take(self):
+        raw = words("看见看见了", [[0,120], [120,240], [600,720], [720,840], [840,960]])
+        timed, owners = clock_transcript([{"start":0,"end":1}], [(0,"看见了。")], ["看见了。"], raw)
+        self.assertEqual(owners, [2,3,4])
+        self.assertEqual(timed[0].start, .6)
+        self.assertEqual(resolve_span(raw,1,2,"看见"), (0,1))
+        self.assertIsNone(resolve_span(raw,1,2,"错引"))
+
+    def test_cloud_first_correction_is_bound_to_a_unique_quote_in_its_sentence(self):
+        lines = [(0,"用这个开源的库"), (0,"这句这句重说")]
+        corrected, audit = apply_corrections(lines, [[1,"开源","开元","近音"],[2,"这句","另句","不唯一"]])
+        self.assertEqual(corrected, ["用这个开元的库","这句这句重说"])
+        self.assertEqual([r["applied"] for r in audit], [True,False])
+
+    @patch("koubo_proofread.api_key", return_value="test")
+    @patch("koubo_proofread.request_review")
+    def test_review_passes_only_times_to_the_blind_listener(self, review, _key):
+        event = {"start": 7, "end": 9, "text": "这个叫蓝播"}
+        review.return_value = ([[1, "这个叫Blue", "改"]], {}, "test")
+        listen = Mock(return_value=["这个叫Blue"])
+        checked, report = review_captions([event], [], listen_again=listen)
+        listen.assert_called_once_with(7, 9)
+        self.assertEqual(checked[0]["text"], "这个叫Blue")
+        self.assertEqual(report["rows"][0]["blind_readings"], ["这个叫Blue"])
+
+    def test_restoring_a_filler_returns_its_word_and_preserves_a_later_cut(self):
+        spans = [[0, 200], [800, 950], [950, 1100], [3900, 4100]]
+        tokens = words("嗯。今天。走", spans)
+        decisions = []
+        make_plan(tokens, [(.2, .8), (1.1, 3.9)], 4.1, 30, decisions=decisions)
+        self.assertEqual([d["reason"] for d in decisions], ["独立语气词", "句末长停顿"])
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "sample.mp4"
+            source.touch()
+            report = source.with_suffix(".json")
+            report.write_text(json.dumps({"source": source.name, "fps": "30", "duration": 4.1,
+                "source_size": 0, "source_words": [asdict(w) for w in tokens], "cut_decisions": decisions,
+                "proofreading": {"model": "test"}}), encoding="utf-8")
+            restored, _, updated, keep, dropped, _ = restore_source_edits(source, 4.1, 30, report, [decisions[0]["id"]])
+            self.assertEqual(restored, tokens)
+            self.assertFalse(dropped)
+            self.assertTrue(updated[0]["restored"])
+            self.assertFalse(updated[1].get("restored"))
+            a, b = decisions[1]["frames"]
+            self.assertEqual(keep, [[0, a], [b, 123]])
+            with self.assertRaisesRegex(ValueError, "找不到可恢复的剪点"):
+                restore_source_edits(source, 4.1, 30, report, ["0-1"])
+
+    @patch("koubo_proofread.api_key", return_value="test")
+    @patch("koubo_proofread.request_review")
+    def test_review_keeps_supported_word_when_another_change_is_unconfirmed(self, review, _key):
+        event = {"start": 1, "end": 4, "text": "这门成序课收费三百元"}
+        local = [{**event, "text": "这门程序课收费三百元"}]
+        review.return_value = ([[1, "这门程序课收费五百元", "改"]], {}, "test")
+        checked, report = review_captions([event], local)
+        self.assertEqual(checked[0], local[0])
+        self.assertEqual(report["unconfirmed"][0]["exported"], local[0]["text"])
+        decisions = report["rows"][0]["word_decisions"]
+        self.assertEqual([d["accepted"] for d in decisions], [True, False])
+
+    def test_verified_sentence_can_support_multiple_edits_including_a_deletion(self):
+        proposed = "最终就是买了一套桌椅"
+        result, _ = apply_review_edits("你最个就是买的一套桌椅", proposed, "改", proposed, "")
+        self.assertEqual(result, proposed)
+
+    def test_uncertain_proposal_stays_out_and_polarity_is_preserved(self):
+        draft = "这门成序课不对外开放"
+        proposed = "这门程序课对外开放"
+        self.assertEqual(apply_review_edits(draft, proposed, "疑", proposed, "")[0], draft)
+        self.assertEqual(apply_review_edits(draft, proposed, "改", proposed, "")[0],
+                         "这门程序课不对外开放")
+
     def test_publish_recognizes_export_and_stops_on_mismatched_subtitles(self):
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "example_cut.mp4"
@@ -36,9 +166,25 @@ class CutPlanTests(unittest.TestCase):
         tokens = words("甲乙", [[0, 200], [1800, 2000]])
         keep, dropped, _ = make_plan(tokens, [(0.3, 0.8), (1.0, 1.6)], 2, 25)
         self.assertTrue(any(a <= 22 < b for a, b in keep))  # untranscribed sound at 0.88 s
-        self.assertEqual(len(keep), 3)
+        self.assertEqual(len(keep), 1)  # Neither quiet run is long enough to shorten on its own.
         events = make_events(tokens, dropped, keep, 25)
         self.assertAlmostEqual(events[-1]["end"], sum(b-a for a, b in keep) / 25)
+
+    def test_sentence_breath_is_preserved_but_a_long_pause_is_shortened(self):
+        spans = [[0, 200], [850, 1050], [3200, 3400]]
+        tokens = words("好。来。走", spans)
+        decisions = []
+        keep, dropped, _ = make_plan(tokens, [(.2, .85), (1.05, 3.2)], 3.4, 25, decisions=decisions)
+        self.assertFalse(dropped)
+        self.assertEqual([d["reason"] for d in decisions], ["句末长停顿"])
+        self.assertGreater(keep[0][1]/25, 1.4)
+        self.assertLess(keep[1][0]/25, 2.85)
+
+    def test_even_long_quiet_inside_nickname_and_between_emphasized_words_stays(self):
+        for text, spans in (("眼镜。姐", [[0,100],[100,200],[2100,2400]]),
+                            ("好，好！", [[0,200],[2200,2400]])):
+            keep, _, _ = make_plan(words(text, spans), [(.2,2.1)], 2.4, 25)
+            self.assertEqual(keep, [[0,60]])
 
     def test_ambiguous_words_stay_in_audio_and_subtitles(self):
         text = "然后其实就是这个那个"
@@ -81,6 +227,13 @@ class CutPlanTests(unittest.TestCase):
         events = caption_events(tokens, limit=1)
         self.assertEqual(events[0], {"text": "而且", "start": 0, "end": 1.6})
         self.assertEqual("".join(e["text"] for e in events), "而且说实话")
+
+    def test_caption_breaks_are_independent_of_the_asr_dictionary(self):
+        tokens = words("请看 blue sky 然后读", [[0,100], [100,200], [200,450],
+                       [2100,2300], [2300,2400], [2400,2500], [2500,2600]])
+        with patch("jieba.posseg.dt.cut", side_effect=AssertionError("unexpected ASR dictionary")):
+            cues = caption_events(tokens, limit=5, wrap=True)
+        self.assertTrue(any("blue sky" in cue["text"] for cue in cues))
 
     def test_asr_period_inside_a_nickname_does_not_change_the_screen(self):
         text = "就是这个口罩。哥，说实话。"

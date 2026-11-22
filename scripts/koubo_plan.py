@@ -7,6 +7,7 @@ import wave
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 import numpy as np
 
@@ -62,15 +63,25 @@ def quiet_ranges(wav_path):
     return [(a / 100, b / 100) for a, b in zip(edges[::2], edges[1::2])]
 
 
-def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12):
+def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12, *, decisions=None):
     if not (math.isfinite(min_pause) and min_pause > 0 and math.isfinite(pad) and pad >= 0):
         raise ValueError("停顿阈值必须大于零，留白必须大于等于零。")
     fps = float(fps)
     frames = round(duration * fps)
+    if not words:
+        raise ValueError("没有可用于决定剪点的原速逐字稿。")
     if frames < 1 or words[-1].end > duration + 1 / fps:
         raise ValueError("转写时间超出视频范围，请核对素材。")
     quiet_ends = [b for _, b in quiet]
     cuts, edits, dropped = [], [], set()
+    if decisions is None:
+        decisions = []
+
+    def record(left, right, reason, first=None, last=None):
+        cuts.append((left, right))
+        decisions.append({"id": f"{left}-{right}", "reason": reason,
+                          "frames": [left, right], "source_start": left / fps,
+                          "source_end": right / fps, "first_word": first, "last_word": last})
 
     def quiet_inside(lo, hi):
         for i in range(bisect_left(quiet_ends, lo), len(quiet)):
@@ -106,7 +117,7 @@ def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12):
         right = nearest(last, False)
         if left is None or right is None or left >= right:
             return False
-        cuts.append((left, right))
+        record(left, right, reason, first, last)
         dropped.update(range(first, last + 1))
         edits.append({"reason": reason, "text": "".join(w.text for w in words[first:last+1]),
                       "start": left / fps, "end": right / fps})
@@ -131,7 +142,7 @@ def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12):
         if i in dropped:
             i += 1
             continue
-        if w.text in ("嗯", "呃") or (w.text in ("啊", "哦", "哎") and w.new_clause and after_clause):
+        if w.text in ("嗯", "呃", "啊", "哦", "哎") and w.new_clause and after_clause:
             remove_words(i, i, "独立语气词")
         elif w.text in ("我", "你", "他", "她"):
             j = i + 1
@@ -149,38 +160,76 @@ def make_plan(words, quiet, duration, fps, min_pause=0.35, pad=0.12):
             i = j - 1
         i += 1
 
+    units = list(lexical_units(words))
+    boundaries = {right.start: (left, right) for left, right in zip(units, units[1:])}
     gaps = zip([0.0] + [w.end for w in words], [w.start for w in words] + [duration])
-    for lo, hi in gaps:
-        if hi - lo < min_pause:
+    for i, (lo, hi) in enumerate(gaps):
+        gap = hi - lo
+        if gap < min_pause or i in dropped or i-1 in dropped:
             continue
-        for a, b in quiet_inside(lo, hi):
-            left = math.ceil((a + pad) * fps)
-            right = math.floor((b - pad) * fps)
-            if lo == 0 and a <= 0.045:
+        margin = pad
+        reason = "片头片尾留白"
+        if 0 < i < len(words):
+            if hi not in boundaries:
+                continue  # even a long hesitation inside a word/name stays
+            left_word, right_word = boundaries[hi]
+            if left_word.text == right_word.text or boundary_quality(left_word.text, right_word.text) < 0:
+                continue
+            if right_word.sentence_start:
+                threshold, margin, reason = 1.10, max(pad, .36), "句末长停顿"
+            elif right_word.new_clause:
+                threshold, margin, reason = .90, max(pad, .27), "分句长停顿"
+            else:
+                threshold, margin, reason = 1.60, max(pad, .38), "句内过长停顿"
+            if gap < threshold:
+                continue
+        # Use one continuous quiet interval; breathing, room sounds or
+        # untranscribed speech between quiet runs are never spliced together.
+        quiet_span = max(quiet_inside(lo, hi), key=lambda span: span[1]-span[0], default=None)
+        if quiet_span:
+            a, b = quiet_span
+            left = math.ceil((a + margin) * fps)
+            right = math.floor((b - margin) * fps)
+            if i == 0 and a <= .045:
                 left = 0
-            if hi == duration and b >= duration - 0.056:
+            if i == len(words) and b >= duration - .056:
                 right = frames
-            if right - left >= max(1, math.ceil(0.08 * fps)):
-                cuts.append((left, right))
+            if right - left >= max(1, math.ceil(.16 * fps)):
+                record(left, right, reason)
 
-    keep, cursor = [], 0
-    for left, right in sorted(cuts):
-        if left > cursor:
-            keep.append([cursor, left])
-        cursor = max(cursor, right)
-    if cursor < frames:
-        keep.append([cursor, frames])
+    keep = kept_ranges(frames, cuts)
     if not keep or len(dropped) == len(words):
         raise ValueError("素材中没有可保留的口播。")
     return keep, dropped, edits
 
 
-def display_tokens(text):
+def kept_ranges(frames, cuts):
+    keep, cursor = [], 0
+    for left, right in sorted(cuts):
+        if not (0 <= left < right <= frames):
+            raise ValueError("剪点超出原片时间。")
+        if left > cursor:
+            keep.append([cursor, left])
+        cursor = max(cursor, right)
+    if cursor < frames:
+        keep.append([cursor, frames])
+    return keep
+
+
+@lru_cache(maxsize=1)
+def caption_tagger():
+    # FunASR's punctuation model loads a user dictionary into jieba's shared
+    # tokenizer. Layout must agree between a fresh export and an offline replay.
+    from jieba.posseg import POSTokenizer
+    return POSTokenizer()
+
+
+def display_tokens(text, tagger=None):
     """Tokenize once across ASR punctuation; attach titles to the nouns they qualify."""
     import jieba.posseg
     result = []
     previous_tag = ""
-    for token, tag in jieba.posseg.cut(text):
+    for token, tag in (tagger or jieba.posseg.dt).cut(text):
         if (token in {"哥", "姐", "叔", "嫂", "爷", "姨", "小哥", "老师", "师傅", "先生", "女士", "们"}
                 and previous_tag.startswith(("n", "eng"))):
             result[-1] += token
@@ -195,13 +244,18 @@ def display_width(text):
     return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in text)
 
 
-def lexical_units(words):
+def lexical_units(words, *, caption_columns=None):
     pieces = [(" " if w.space else "") + w.text for w in words]
+    text = "".join(pieces)
     offset = 0
     boundaries = set()
-    for token in display_tokens("".join(pieces)):
+    for token in display_tokens(text, caption_tagger() if caption_columns is not None else None):
         offset += len(token)
         boundaries.add(offset)
+    if caption_columns is not None:
+        for match in re.finditer(r"[A-Za-z]+(?: +[A-Za-z]+)+", text):
+            if display_width(match[0]) <= 2 * caption_columns:
+                boundaries.difference_update(range(match.start() + 1, match.end()))
     start = offset = 0
     for i, piece in enumerate(pieces):
         offset += len(piece)
@@ -357,7 +411,7 @@ def align_reviewed_words(words, events):
 
 def caption_events(words, limit=14, *, wrap=False):
     """Choose display cues on the playback clock, keeping a second line for weak seams."""
-    units = list(lexical_units(words))
+    units = list(lexical_units(words, caption_columns=limit))
     pieces = [(" " if w.space else "") + w.text for w in units]
     widths = [display_width(piece) for piece in pieces]
     n = len(units)
