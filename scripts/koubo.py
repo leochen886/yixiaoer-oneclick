@@ -268,7 +268,7 @@ def is_exported_video(video):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("video", type=Path)
+    parser.add_argument("video", nargs="?", help="口播原片路径")
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parents[1] / "output")
     parser.add_argument("--min-pause", type=float, default=0.35, help="开始检查停顿的秒数（默认 0.35）")
     parser.add_argument("--open-folder", action="store_true", help="完成后在资源管理器中打开成片目录")
@@ -285,7 +285,22 @@ def main():
             (args.local_subtitles or args.asr_reference or args.deepseek_audio or args.publish_path_file)):
         parser.error("--restore-cut 需要 --cut-report。使用剪辑记录时只支持本地重导出。")
     try:
-        source = args.video.absolute()
+        video_path = args.video
+        if not video_path:
+            if not args.open_folder or args.publish_path_file:
+                parser.error("请提供视频路径。")
+            try:
+                video_path = input("把原视频拖进这个窗口或粘贴文件路径，然后按回车（直接回车取消）：\n").strip()
+            except (EOFError, KeyboardInterrupt):
+                video_path = ""
+            if not video_path:
+                print("已取消剪辑。")
+                return
+            if len(video_path) >= 2 and video_path[0] == video_path[-1] and video_path[0] in "\"'":
+                video_path = video_path[1:-1]
+        source = Path(video_path).absolute()
+        if not source.is_file():
+            raise ValueError(f"找不到视频文件：{source}")
         if args.publish_path_file and is_exported_video(source):
             video = source
             destination = video.parent

@@ -77,7 +77,44 @@ def index_inputs(receipt, anchors, meta, min_pause=.35):
     return sentences, gaps, content
 
 
-def ask_flash(content, records):
+DECISION_TYPES = ("corrections", "repeats", "pauses")
+
+
+def sum_usage(total, usage):
+    for key, value in usage.items():
+        if isinstance(value, dict):
+            sum_usage(total.setdefault(key, {}), value)
+        elif type(value) is int:
+            total[key] = total.get(key, 0) + value
+
+
+def collect_scoped_decisions(request, payload, limits):
+    proposal = {key: [] for key in DECISION_TYPES}
+    for key in DECISION_TYPES:
+        pending = [(1, limits[key])] if limits[key] else []
+        while pending:
+            first, last = pending.pop()
+            scope = f"{key} {first}–{last}"
+            instruction = (f"本次只返回 {key} 中第一列编号为 {first} 到 {last}（含）的条目。"
+                           "其余数组返回空。保留原始编号，可以引用范围外的上下文和保留的重说。")
+            messages = [{"role": "system", "content": PROMPT + "\n" + instruction},
+                        payload["messages"][1]]
+            batch = request({**payload, "messages": messages}, scope)
+            if batch is None:
+                if first == last:
+                    raise ValueError(f"Flash 在单个决策编号 {scope} 仍返回 length，未生成剪点。")
+                mid = (first + last) // 2
+                pending.extend([(mid + 1, last), (first, mid)])
+                continue
+            for row in batch[key]:
+                if not isinstance(row, list) or not row or type(row[0]) is not int:
+                    raise ValueError(f"Flash 分批决策缺少有效编号（{scope}）。")
+                if first <= row[0] <= last:
+                    proposal[key].append(row)
+    return proposal
+
+
+def ask_flash(content, records, limits):
     payload = {"model": MODEL, "thinking": {"type":"enabled"}, "reasoning_effort":"low",
                "max_tokens": 16000, "response_format":{"type":"json_object"},
                "messages":[{"role":"system","content":PROMPT},
@@ -90,18 +127,48 @@ def ask_flash(content, records):
             raise ValueError("记录中的 Flash 请求与本次盲测输入不同。")
         return result
     save(records / "flash-input.json", payload)
-    response = requests.post(ENDPOINT, json=payload, headers={"Authorization":"Bearer "+api_key()},
-                             timeout=(15, 330), allow_redirects=False)
-    response.raise_for_status()
-    data = response.json()
-    choice = data["choices"][0]
-    if choice["finish_reason"] != "stop":
-        raise ValueError(f"Flash 未返回完整决策，状态 {choice['finish_reason']}")
-    proposal = json.loads(choice["message"]["content"])
-    if not all(isinstance(proposal.get(k), list) for k in ("corrections","repeats","pauses")):
-        raise ValueError("Flash 剪辑清单格式不完整。")
-    result = dict(input_sha256=digest, model=data["model"], request_id=data["id"],
-                  usage=data["usage"], proposal=proposal)
+    headers = {"Authorization": "Bearer " + api_key()}
+    attempts, usage = [], {}
+
+    def request(body, scope):
+        response = requests.post(ENDPOINT, json=body, headers=headers, timeout=(15, 330),
+                                 allow_redirects=False)
+        response.raise_for_status()
+        data = response.json()
+        choice = data["choices"][0]
+        reason = choice["finish_reason"]
+        attempts.append({"request_id": data["id"], "model": data["model"], "scope": scope,
+                         "thinking": body["thinking"]["type"], "finish_reason": reason,
+                         "usage": data["usage"]})
+        sum_usage(usage, data["usage"])
+        if reason == "length":
+            spent = data["usage"].get("completion_tokens")
+            reasoning = (data["usage"].get("completion_tokens_details") or {}).get("reasoning_tokens")
+            detail = f"，输出 {spent} tokens" if spent is not None else ""
+            if reasoning is not None:
+                detail += f"，其中思考 {reasoning} tokens"
+            print(f"Flash 决策被截断（{scope}{detail}，请求 {data['id']}）。", flush=True)
+            return None
+        if reason != "stop":
+            raise ValueError(f"Flash 未返回完整决策，状态 {reason}（请求 {data['id']}）。")
+        proposal = json.loads(choice["message"]["content"])
+        if not isinstance(proposal, dict) or not all(isinstance(proposal.get(k), list) for k in DECISION_TYPES):
+            raise ValueError(f"Flash 剪辑清单格式不完整（请求 {data['id']}）。")
+        return proposal
+
+    proposal = request(payload, "全文")
+    if proposal is None:
+        # Keep the original transcript, acoustic anchors and prompt. Free the output
+        # budget for the decision JSON before resorting to narrower decisions.
+        print("沿用本次听写和字词时间，关闭思考模式，重试全文剪辑决策…", flush=True)
+        retry = {**payload, "thinking": {"type": "disabled"}}
+        del retry["reasoning_effort"]
+        proposal = request(retry, "全文")
+        if proposal is None:
+            print("全文回复再次被截断，按决策类型和编号分批返回，仍提供全文。", flush=True)
+            proposal = collect_scoped_decisions(request, retry, limits)
+    result = dict(input_sha256=digest, model=attempts[-1]["model"], request_id=attempts[-1]["request_id"],
+                  request_ids=[a["request_id"] for a in attempts], attempts=attempts, usage=usage, proposal=proposal)
     save(path, result)
     return result
 
@@ -315,15 +382,19 @@ def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35
     anchors = [Word(**w) for w in read(records/"anchors.json")]
     sentences, gaps, content = index_inputs(receipt,anchors,meta,min_pause)
     print(f"正在使用 DeepSeek Flash 核对全文（{len(sentences)} 句），判断重说与气口…", flush=True)
-    flash = ask_flash(content,records)
+    limits = {"corrections": len(sentences), "repeats": len(anchors), "pauses": len(gaps)}
+    flash = ask_flash(content, records, limits)
     proposal = flash["proposal"]
     reviewed, correction_audit = apply_corrections(sentences,proposal["corrections"])
     timed, owners = clock_transcript(receipt["chunks"],sentences,reviewed,anchors)
     cuts, audit = select_cuts(anchors,owners,gaps,proposal,meta,wav)
     proof = {"input_mode":"deepseek_audio_first","model":flash["model"],
-             "request_ids":[flash["request_id"]],"usage":flash["usage"],"audio_asr":receipt["chunks"],
+             "request_ids":flash.get("request_ids", [flash["request_id"]]),
+             "usage":flash["usage"],"audio_asr":receipt["chunks"],
              "input_sha256":flash["input_sha256"],"full_text":reviewed,
              "correction_audit":correction_audit,"cut_audit":audit,"source_sha256":digest}
+    if "attempts" in flash:
+        proof["flash_attempts"] = flash["attempts"]
     plan = {"source":source.name,"source_size":source.stat().st_size,"fps":str(rate),"duration":duration,
             "cut_decisions":cuts,"source_words":[asdict(w) for w in timed],"proofreading":proof}
     path = records / "原片剪点.json"
