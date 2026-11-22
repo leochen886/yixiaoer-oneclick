@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 import wave
 from bisect import bisect_left
@@ -293,9 +294,9 @@ def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_ch
         for field in ("prompt_tokens", "completion_tokens", "prompt_cache_hit_tokens"):
             report[field] += int(usage.get(field, 0))
 
-    batches = deque((start, min(start+32, len(events))) for start in range(0, len(events), 32))
+    batches = deque((start, min(start+32, len(events)), 0) for start in range(0, len(events), 32))
     while batches:
-        start, end = batches.popleft()
+        start, end, retries = batches.popleft()
         batch = events[start:end]
         inputs = []
         for i, event in enumerate(batch, start + 1):
@@ -330,12 +331,27 @@ def review_captions(events, reference, receipt=None, spot_checks=(), acoustic_ch
             content["本条视频的原声听写（含未剪原片内容）"] = hearing
         try:
             rows, usage, request_id = request_review(content, key, model)
+        except (requests.exceptions.ChunkedEncodingError, requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError) as exc:
+            if retries == 2:
+                raise RuntimeError(f"DeepSeek 第 {start+1}–{end} 条字幕校对仍未收到完整响应"
+                                   f"（{type(exc).__name__}: {exc}）。") from exc
+            report.setdefault("transport_failures", []).append(
+                {"first_cue": start+1, "last_cue": end, "error": type(exc).__name__})
+            print(f"DeepSeek 第 {start+1}–{end} 条字幕响应中断，正在重试这部分。", flush=True)
+            time.sleep(2 ** retries)
+            if len(batch) == 1:
+                batches.appendleft((start, end, retries+1))
+            else:
+                mid = (start + end) // 2
+                batches.extendleft([(mid, end, retries+1), (start, mid, retries+1)])
+            continue
         except ReviewTruncated as exc:
             record_request(exc.request_id, exc.usage)
             if len(batch) == 1:
                 raise
             mid = (start + end) // 2
-            batches.extendleft([(mid, end), (start, mid)])
+            batches.extendleft([(mid, end, retries), (start, mid, retries)])
             continue
         if (not isinstance(rows, list) or len(rows) != len(inputs)
                 or any(not isinstance(row, list) or len(row) != 3 or type(row[0]) is not int

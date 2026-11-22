@@ -439,9 +439,28 @@ try {
     if ($CutKoubo -or $PrepareOnly) {
         $pathFile = Join-Path $runDir 'prepared-video.txt'
         Write-Log '正在准备带字幕的口播成片……' Cyan
-        & python -X utf8 (Join-Path $ScriptDir 'koubo.py') $videoPath --publish-path-file $pathFile
-        if ($LASTEXITCODE -ne 0 -or -not [IO.File]::Exists($pathFile)) {
-            throw '剪口播未完成，已停止发布。'
+        $lastCutMessage = ''
+        $previousPreference = $ErrorActionPreference
+        try {
+            # Windows PowerShell 5.1 also wraps native stderr progress in error records.
+            $ErrorActionPreference = 'Continue'
+            & python -u -X utf8 (Join-Path $ScriptDir 'koubo.py') $videoPath --publish-path-file $pathFile 2>&1 |
+                ForEach-Object {
+                    $line = $_.ToString().TrimEnd()
+                    if ($line.Trim()) {
+                        $lastCutMessage = $line
+                        Write-Log $line
+                    }
+                }
+            $cutExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($cutExit -ne 0) {
+            throw ("剪口播退出码 {0}。{1}  完整日志：{2}" -f $cutExit, $lastCutMessage, $script:LogFile)
+        }
+        if (-not [IO.File]::Exists($pathFile)) {
+            throw ("剪口播已退出，但没有生成成片路径记录：{0}" -f $pathFile)
         }
         $videoPath = [IO.File]::ReadAllText($pathFile, [Text.Encoding]::UTF8)
         if (-not [IO.File]::Exists($videoPath)) { throw '本次成片文件不存在，已停止发布。' }

@@ -6,6 +6,7 @@ import unittest
 import wave
 from pathlib import Path
 from unittest.mock import patch
+from requests.exceptions import ChunkedEncodingError
 from koubo import is_exported_video
 from koubo_plan import align_reviewed_words, caption_events, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, compatible, project_reference, review_captions, transcribe_deepseek
@@ -201,6 +202,33 @@ class CutPlanTests(unittest.TestCase):
         self.assertEqual(fixed, events)
         self.assertEqual(report["request_ids"], ["partial", "first", "second"])
         self.assertEqual((report["completion_tokens"], report["checked_cues"]), (922, 2))
+
+    @patch("koubo_proofread.time.sleep")
+    @patch("koubo_proofread.api_key", return_value="test")
+    @patch("koubo_proofread.request_review")
+    def test_interrupted_response_retries_only_failed_cues(self, review, _key, sleep):
+        events = [{"start": i, "end": i+1, "text": "测试"} for i in range(34)]
+        def reply(a, b):
+            return ([[i, "测试", "原"] for i in range(a, b+1)], {"prompt_tokens": 5}, str(a))
+        review.side_effect = [reply(1, 32), ChunkedEncodingError("Response ended prematurely"),
+                              reply(33, 33), reply(34, 34)]
+        fixed, report = review_captions(events, [])
+        self.assertEqual(fixed, events)
+        batches = [next(v for k, v in call.args[0].items() if k.startswith("字幕行"))
+                   for call in review.call_args_list]
+        self.assertEqual([(rows[0][0], rows[-1][0]) for rows in batches],
+                         [(1, 32), (33, 34), (33, 33), (34, 34)])
+        self.assertEqual(report["checked_cues"], 34)
+        self.assertEqual(report["transport_failures"][0]["first_cue"], 33)
+        sleep.assert_called_once_with(1)
+
+    @patch("koubo_proofread.time.sleep")
+    @patch("koubo_proofread.api_key", return_value="test")
+    @patch("koubo_proofread.request_review", side_effect=ChunkedEncodingError("Response ended prematurely"))
+    def test_persistent_interruption_stops_with_cue_number(self, review, _key, _sleep):
+        with self.assertRaisesRegex(RuntimeError, "第 1–1 条字幕.*ChunkedEncodingError"):
+            review_captions([{"start": 0, "end": 1, "text": "测试"}], [])
+        self.assertEqual(review.call_count, 3)
 
     def test_audio_reference_preserves_whole_words_and_right_hand_anchor(self):
         rows = [{"text": s} for s in ("封号sure", "第一真狠", "这真的大漂乱滚", "真的是让我长见识")]
