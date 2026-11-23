@@ -11,7 +11,8 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import Mock, patch
 from requests.exceptions import ChunkedEncodingError
-from koubo import check_caption_coverage, export, is_exported_video, main as cut_main, restore_source_edits, write_burn_captions
+from koubo import (EXPORT_LAYOUT, check_caption_coverage, export, is_exported_video,
+                   main as cut_main, render, restore_source_edits, verified_export_hash, write_burn_captions)
 from koubo_deepseek import apply_corrections, clock_transcript, resolve_span, spoken, supplement_hearing
 from koubo_hook import prepare_hook
 from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
@@ -23,23 +24,25 @@ def words(text, spans):
 
 
 class CutPlanTests(unittest.TestCase):
-    def test_offline_hook_uses_the_recording_and_keeps_the_approved_size_on_portrait_video(self):
+    def test_offline_hook_uses_the_recording_and_matches_the_portrait_preview(self):
         tokens = [Word("为什么越浇越蔫", 0, 1, True, False),
                   Word("花怎么养", 1, 2, True, False)]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            wide, _ = prepare_hook(root, tokens, 1920, 1080)
-            self.assertEqual(wide, "为什么越浇越蔫？")
-            narrow, draw = prepare_hook(root, tokens, 1080, 1920, suggested_title=wide)
-            self.assertEqual(narrow, "花怎么养？")
-            self.assertIn("fontsize=178", draw)
-            self.assertIn("x=(w-tw)/2:y=71", draw)
+            title, draw = prepare_hook(root, tokens)
+            self.assertEqual(title, "为什么越浇越蔫？")
+            self.assertIn("fontsize=84", draw)
+            self.assertIn("x=(w-tw)/2:y=419-th/2", draw)
+            previous = "这是横版原片里已经确认过的一句长标题"
+            title, draw = prepare_hook(root, [], suggested_title=previous, replay_title=True)
+            self.assertEqual(title, previous)
+            self.assertNotIn("fontsize=84:", draw)
 
     def test_offline_or_explicit_reference_does_not_send_the_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "sample.mp4"
-            with patch("koubo.probe", return_value=(0, 2.0, Fraction(30), 16, 1920, 1080)), \
+            with patch("koubo.probe", return_value=(0, 2.0, Fraction(30))), \
                     patch("koubo.build_cut_plan") as cloud, \
                     patch("koubo.prepare_source_edits", side_effect=ValueError("local path")) as local:
                 for mode in ({"local_subtitles": True}, {"asr_reference": root / "reference.json"}):
@@ -64,7 +67,7 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(video, source)
                 self.assertTrue(send_audio)
                 self.assertEqual(min_pause, .35)
-                self.assertEqual(hook_chars, 16)
+                self.assertEqual(hook_chars, 12)
                 records.mkdir()
                 record = records / "plan.json"
                 record.write_text(json.dumps({"source":video.name, "fps":str(rate), "duration":duration,
@@ -76,7 +79,7 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual((keep, frames), ([[0,13],[52,78]], 30))
                 self.assertEqual((work / "hook.txt").read_text(encoding="utf-8"), "早起有多早？")
                 self.assertNotIn("早起有多早", (work / "captions.srt").read_text(encoding="utf-8"))
-                self.assertIn("fontsize=100:fontcolor=0xFFDA20:borderw=6:bordercolor=black:x=(w-tw)/2:y=40", hook_filter)
+                self.assertIn("fontsize=84:fontcolor=0xFFDA20:borderw=0:bordercolor=black:x=(w-tw)/2:y=419-th/2", hook_filter)
                 (work / "render.mp4").touch()
 
             with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
@@ -87,6 +90,7 @@ class CutPlanTests(unittest.TestCase):
                         destination = cut_main()
                     report = json.loads((destination / "剪辑记录.json").read_text(encoding="utf-8"))
                     self.assertEqual(report["speed"], 1.3)
+                    self.assertEqual(report["layout"], EXPORT_LAYOUT)
                     self.assertEqual(report["hook_title"], "早起有多早？")
                     self.assertEqual(report["proofreading"]["input_mode"], "deepseek_audio_first")
                     self.assertEqual([d["reason"] for d in report["cut_decisions"]], ["复核静音"])
@@ -284,6 +288,7 @@ class CutPlanTests(unittest.TestCase):
                       "proofreading": {"srt_sha256": hashlib.sha256(srt.read_bytes()).hexdigest()}}
             video.with_name("剪辑记录.json").write_text(json.dumps(report), encoding="utf-8")
             self.assertFalse(is_exported_video(video.with_name("example.mp4")))
+            self.assertIsNone(verified_export_hash(video, from_source=True))
             with patch("koubo.probe", return_value=(0, 1.5, 25)):
                 self.assertTrue(is_exported_video(video))
                 video.write_bytes(b"previous MP4")
@@ -422,6 +427,38 @@ class CutPlanTests(unittest.TestCase):
         # bring its embedded line break back into the exported SRT.
         old = Word("native\nAI", 0, 1, True, False)
         self.assertEqual(caption_events([old], 3)[0]["text"], "native AI")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "requires ffmpeg")
+    def test_export_crops_display_aspect_and_keeps_both_overlays_in_black_bands(self):
+        import numpy as np
+        for width, sar in [(320, "1/1"), (240, "4/3")]:
+            with self.subTest(sar=sar), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source.mp4"
+                # The red outer eighths disappear. The white middle quarter becomes a third.
+                bars = (f"color=red:s={width}x180:r=4:d=1,"
+                        f"drawbox=x={width//8}:w={3*width//4}:h=ih:c=blue:t=fill,"
+                        f"drawbox=x={3*width//8}:w={width//4}:h=ih:c=white:t=fill,setsar={sar}")
+                subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", bars,
+                                "-f", "lavfi", "-i", "anullsrc=r=48000", "-t", "1",
+                                "-c:v", "libx264", "-c:a", "aac", str(source)], check=True)
+                cue = {"start": 0, "end": 1, "text": "自己剪了过后自己配文案"}
+                write_burn_captions(root / "captions.ass", [cue], 16)
+                _, hook = prepare_hook(root, [], suggested_title="剪口播，能全自动吗？")
+                render(source, root, 0, Fraction(4), [(0, 4)], 3, hook)
+                data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(root / "render.mp4"),
+                                                "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                frame = np.frombuffer(data, np.uint8).reshape(1920, 1080, 3)
+                blue_rows = np.where(frame[:, 20, 2] > 200)[0]
+                self.assertAlmostEqual(blue_rows[0], 555, delta=2)
+                self.assertAlmostEqual(blue_rows[-1], 1364, delta=2)
+                self.assertGreater(frame[960, -20, 2], 200)
+                white_cols = np.where(frame[960].min(axis=1) > 200)[0]
+                self.assertAlmostEqual(white_cols[0], 360, delta=4)
+                self.assertAlmostEqual(white_cols[-1], 719, delta=4)
+                for start, end, center in [(0, 550, 419), (1370, 1920, 1461)]:
+                    rows = np.where(frame[start:end, :, :2].min(axis=2) > 150)[0]
+                    self.assertAlmostEqual(start + (rows.min() + rows.max()) / 2, center, delta=3)
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "requires ffmpeg")
     def test_burned_portrait_subtitle_fits_on_one_visible_line(self):

@@ -13,9 +13,10 @@ from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
+from PIL import ImageFont
 
 from koubo_deepseek import build_cut_plan, compact_silences
-from koubo_hook import prepare_hook
+from koubo_hook import HOOK_CHAR_LIMIT, prepare_hook
 from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
                         nearby_speech_gaps, quiet_ranges, read_words, review_groups)
 from koubo_proofread import file_sha256, read_reference, review_captions
@@ -24,6 +25,8 @@ from transcribe_funasr import transcribe
 
 
 SPEED = Fraction(13, 10)
+EXPORT_LAYOUT = "portrait-1080x1920-center-4x3-v1"
+CAPTION_COLUMNS = 16
 
 
 def probe(source, *, with_layout=False):
@@ -110,18 +113,29 @@ def check_caption_coverage(video, events, duration):
     return audit
 
 
-def write_burn_captions(path, events, columns):
-    # Match the previous SRT renderer's coordinate system, font and margins.
-    # ASS WrapStyle 2 disables automatic wrapping inside the encoded video.
-    header = """[Script Info]
+def write_burn_captions(path, events, columns, *, legacy_layout=False):
+    if legacy_layout:
+        width, height = 384, 288
+        base_size, outline, alignment, margin = 22, 1.2, 2, 30
+        position = ""
+    else:
+        width, height = 1080, 1920
+        font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyhbd.ttc"
+        font = ImageFont.truetype(str(font_path), 54)
+        # libass sizes by line height. YaHei Bold has 2703 line units per 2048-unit em.
+        base_size = round(54 * 2703 / 2048, 3)
+        outline, alignment, margin = 0, 5, 0
+        # The line box is 3 px above the visible glyph center in the approved sample.
+        position = r"\pos(540,1458)"
+    header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 384
-PlayResY: 288
+PlayResX: {width}
+PlayResY: {height}
 WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,22,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1.2,0,2,10,10,30,1
+Style: Default,Microsoft YaHei,{base_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,{alignment},10,10,{margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -136,21 +150,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         out.write(header)
         for cue in events:
             text = cue["text"]
-            # Allow one em per glyph, including wide Latin letters. An
-            # indivisible oversized term stays intact and scales for this cue.
-            size = 22 * columns / max(len(text), columns)
-            style = rf"{{\fs{size:.3f}}}" if size < 22 else ""
+            if legacy_layout:
+                size = base_size * columns / max(len(text), columns)
+            else:
+                available = width * .94
+                size = base_size * available / max(font.getlength(text), available)
+            tags = position + (rf"\fs{size:.3f}" if size < base_size else "")
+            style = "{" + tags + "}" if tags else ""
             # A literal backslash must never introduce an ASS newline or tag.
             literal = text.replace("\\", "\\\u2060").replace("{", r"\{").replace("}", r"\}")
             out.write(f"Dialogue: 0,{stamp(cue['start'])},{stamp(cue['end'])},Default,,0,0,0,,{style}{literal}\n")
 
 
-def render(source, work, video_index, fps, keep, output_frames, hook_filter=None, *, legacy_srt=False):
+def render(source, work, video_index, fps, keep, output_frames, hook_filter=None, *,
+           legacy_layout=False, legacy_srt=False):
     select = "+".join(f"between(n,{a},{b-1})" for a, b in keep)
     overlays = "ass=captions.ass" + ("," + hook_filter if hook_filter else "")
     if legacy_srt:
         style = "FontName=Microsoft YaHei,Bold=1,FontSize=22,Outline=1.2,Shadow=0,MarginV=30"
         overlays = f"subtitles=captions.srt:force_style='{style}'"
+    if not legacy_layout:
+        # FFmpeg autorotates before this crop. Use display proportions for anamorphic inputs.
+        sar = "if(gt(sar,0),sar,1)"
+        overlays = (f"crop=w='min(iw,ih*4/3/{sar})':h='min(ih,iw*{sar}*3/4)',"
+                    "scale=1080:810,setsar=1,pad=1080:1920:0:(oh-ih)/2:black," + overlays)
     # Select CFR video frames once. Rebase their PTS before rendering subtitles.
     video = (f"[0:{video_index}]fps={fps}:start_time=0,select='{select}',setpts=N,"
              f"settb=AVTB,setpts=PTS*{SPEED.denominator}/{SPEED.numerator},fps={fps},"
@@ -273,7 +296,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
     if compact_pauses is None:
         # New recordings use the compact rhythm; a replay follows its saved cuts.
         compact_pauses = cut_report is None
-    idx, duration, rate, columns, width, height = probe(source, with_layout=True)
+    idx, duration, rate = probe(source)
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
         work = Path(temp)
@@ -285,9 +308,8 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
             words, proof, decisions, keep, dropped, edits = prepare_source_edits(
                 source, work, duration, rate, min_pause, local_subtitles, asr_reference)
         else:
-            hook_chars = max(1, min(16, int(width * .92 / (height * 100 / 1080))))
             plan = build_cut_plan(source, work / "原声记录", duration, rate,
-                                  send_audio=True, min_pause=min_pause, hook_chars=hook_chars)
+                                  send_audio=True, min_pause=min_pause, hook_chars=HOOK_CHAR_LIMIT)
             words, proof, decisions, keep, dropped, edits, suggested_title = restore_source_edits(
                 source, duration, rate, plan, ())
         frames = round(duration * float(rate))
@@ -325,11 +347,11 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                 entry["output_time"] = output_time(entry["source_time"])
         for decision in decisions:
             decision["output_time"] = output_time(decision["source_start"])
-        events = caption_events(timed, limit=columns, end_time=out_seconds)
+        events = caption_events(timed, limit=CAPTION_COLUMNS, end_time=out_seconds)
         write_srt(work / "captions.srt", events)
-        write_burn_captions(work / "captions.ass", events, columns)
-        hook_title, hook_filter = prepare_hook(work, retained, width, height,
-                                               suggested_title=suggested_title)
+        write_burn_captions(work / "captions.ass", events, CAPTION_COLUMNS)
+        hook_title, hook_filter = prepare_hook(work, retained, suggested_title=suggested_title,
+                                               replay_title=cut_report is not None)
         proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
@@ -343,6 +365,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         (work / "render.mp4").rename(package / (name + ".mp4"))
         (work / "captions.srt").rename(package / (name + ".srt"))
         report = {"source": source.name, "source_size": source.stat().st_size, "hook_title": hook_title,
+                  "layout": EXPORT_LAYOUT,
                   "source_sha256": proof.get("source_sha256") or file_sha256(source),
                   "caption_coverage": coverage, "video_sha256": file_sha256(package / (name + ".mp4")),
                   "duration": duration, "output_duration": out_seconds,
@@ -413,14 +436,17 @@ def reproduce_legacy_hash(video, srt_bytes, info):
             if (work / "captions.srt").read_bytes() != srt_bytes:
                 raise ValueError("旧记录中的字幕与所选 SRT 不一致。")
         (work / "captions.srt").write_bytes(srt_bytes)
-        write_burn_captions(work / "captions.ass", events, columns)
+        legacy_layout = info.get("layout") != EXPORT_LAYOUT
+        write_burn_captions(work / "captions.ass", events, columns, legacy_layout=legacy_layout)
         overlay = None
         if info.get("hook_title"):
-            _, overlay = prepare_hook(work, [], width, height, suggested_title=info["hook_title"])
+            _, overlay = prepare_hook(work, [], suggested_title=info["hook_title"],
+                                      legacy_dimensions=(width, height) if legacy_layout else None,
+                                      replay_title=not legacy_layout)
         modes = [False] if overlay else ([False, True] if info.get("display_cues") else [True])
         for legacy in modes:
             render(source.resolve(), work, index, rate, keep, round(info["output_duration"] * rate),
-                   overlay, legacy_srt=legacy)
+                   overlay, legacy_layout=legacy_layout, legacy_srt=legacy)
             rebuilt = work / "render.mp4"
             if file_sha256(rebuilt) == actual:
                 return actual
@@ -434,6 +460,8 @@ def verified_export_hash(video, *, handoff=None, from_source=False):
         return None
     info = json.loads(report_path.read_text(encoding="utf-8-sig"))
     if not isinstance(info, dict) or not isinstance(info.get("source"), str) or "keep" not in info:
+        return None
+    if from_source and info.get("layout") != EXPORT_LAYOUT:
         return None
     original = Path(info["source"])
     if video.name == original.name:

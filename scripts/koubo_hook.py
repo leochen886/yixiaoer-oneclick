@@ -7,6 +7,11 @@ from pathlib import Path
 from PIL import ImageFont
 
 
+HOOK_SIZE = 84
+HOOK_WIDTH = 1080 * .94
+HOOK_CHAR_LIMIT = int(HOOK_WIDTH / HOOK_SIZE)
+
+
 def extract_hook(transcript, fits):
     """Build a local hook from a spoken question, a contrast or a concrete detail."""
     from jieba.analyse import extract_tags
@@ -43,21 +48,30 @@ def extract_hook(transcript, fits):
     return excerpt + "…"
 
 
-def prepare_hook(work, words, width, height, *, suggested_title=None):
-    # At 1920x1080 these are the exact drawtext settings of the approved preview.
+def prepare_hook(work, words, *, suggested_title=None, legacy_dimensions=None, replay_title=False):
     font_path = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "msyhbd.ttc"
-    size = max(1, round(height * 100 / 1080))
-    border = max(1, round(height * 6 / 1080))
-    top = round(height * 40 / 1080)
+    size, available = HOOK_SIZE, HOOK_WIDTH
+    top, border = "419-th/2", 0
+    if legacy_dimensions:
+        # A pre-portrait export must reproduce its original raster for hash verification.
+        width, height = legacy_dimensions
+        size = max(1, round(height * 100 / 1080))
+        border = max(1, round(height * 6 / 1080))
+        top = round(height * 40 / 1080)
+        available = width * .94 - 2 * border
     font = ImageFont.truetype(str(font_path), size)
-    available = width * .94 - 2 * border
+
+    def valid(title):
+        return (isinstance(title, str) and bool(title.strip()) and title.isprintable()
+                and any(char.isalnum() for char in title))
 
     def fits(title):
-        return (isinstance(title, str) and bool(title.strip()) and title.isprintable()
-                and any(char.isalnum() for char in title)
-                and font.getlength(title.strip()) <= available)
+        return valid(title) and font.getlength(title.strip()) <= available
 
-    if fits(suggested_title):
+    if replay_title and valid(suggested_title):
+        title = suggested_title.strip()
+        size = max(1, int(size * min(1, available / font.getlength(title))))
+    elif fits(suggested_title):
         title = suggested_title.strip()
     else:
         transcript = "".join(("\n" if w.sentence_start else "，" if w.new_clause else " " if w.space else "")
