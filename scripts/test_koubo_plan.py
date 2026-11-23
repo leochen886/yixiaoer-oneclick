@@ -14,7 +14,7 @@ from requests.exceptions import ChunkedEncodingError
 from koubo import (EXPORT_LAYOUT, check_caption_coverage, export, is_exported_video,
                    main as cut_main, render, restore_source_edits, verified_export_hash, write_burn_captions)
 from koubo_deepseek import apply_corrections, clock_transcript, resolve_span, spoken, supplement_hearing
-from koubo_hook import prepare_hook
+from koubo_hook import clean_line, prepare_hook, previous_hook_overlay
 from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
 
@@ -29,14 +29,37 @@ class CutPlanTests(unittest.TestCase):
                   Word("花怎么养", 1, 2, True, False)]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            title, draw = prepare_hook(root, tokens)
-            self.assertEqual(title, "为什么越浇越蔫？")
-            self.assertIn("fontsize=84", draw)
+            title, context, draw = prepare_hook(root, tokens)
+            self.assertEqual((title, context), ("为什么越浇越蔫", ""))
+            self.assertIn("fontsize=90", draw)
             self.assertIn("x=(w-tw)/2:y=419-th/2", draw)
             previous = "这是横版原片里已经确认过的一句长标题"
-            title, draw = prepare_hook(root, [], suggested_title=previous, replay_title=True)
-            self.assertEqual(title, previous)
+            draw = previous_hook_overlay(root, previous)
+            self.assertEqual((root / "hook.txt").read_text(encoding="utf-8"), previous)
             self.assertNotIn("fontsize=84:", draw)
+
+    def test_context_budget_and_retained_evidence(self):
+        tokens = [Word("阳台那盆花蔫了", 0, 1, True, False), Word("为什么越浇越蔫", 1, 2, True, False),
+                  Word("根泡坏了", 2, 3, True, False)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            options = dict(hook_title="每天浇花，根会烂吗？", hook_context="阳台那盆花蔫了",
+                           hook_evidence="根泡坏了")
+            title, context, draw = prepare_hook(root, tokens, **options)
+            self.assertEqual((title, context), ("每天浇花根会烂吗", "阳台那盆花蔫了"))
+            self.assertIn("fontsize=54", draw)
+            for replacement in ("每天浇花根会烂吗", "有" * 17, "为什么要浇花", "根泡坏了"):
+                self.assertEqual(prepare_hook(root, tokens, **(options | {"hook_context": replacement}))[1], "")
+            for replacement in ({"hook_evidence": "录音里没有"}, {"hook_title": "你知道吗"},
+                                {"hook_title": "这" * 12 + "吗"}):
+                self.assertEqual(prepare_hook(root, tokens, **(options | replacement))[:2], ("为什么越浇越蔫", ""))
+            self.assertEqual(clean_line("还会跌1.5%吗？"), "还会跌百分之1点5吗")
+            self.assertEqual(clean_line("需要1-3天吗"), "")
+            for throwaway in ("有毛病吗", "这都是什么鬼东西呀"):
+                self.assertEqual(prepare_hook(root, [Word(throwaway, 0, 1, True, False), *tokens])[0],
+                                 "为什么越浇越蔫")
+            self.assertEqual(prepare_hook(root, [], hook_title="英伟达盘前暴涨26%，卖不卖？")[:2],
+                             ("卖不卖", "英伟达盘前暴涨百分之26"))
 
     def test_offline_or_explicit_reference_does_not_send_the_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,7 +90,7 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(video, source)
                 self.assertTrue(send_audio)
                 self.assertEqual(min_pause, .35)
-                self.assertEqual(hook_chars, 12)
+                self.assertEqual(hook_chars, 24)
                 records.mkdir()
                 record = records / "plan.json"
                 record.write_text(json.dumps({"source":video.name, "fps":str(rate), "duration":duration,
@@ -77,9 +100,9 @@ class CutPlanTests(unittest.TestCase):
 
             def mock_render(video, work, index, fps, keep, frames, hook_filter):
                 self.assertEqual((keep, frames), ([[0,13],[52,78]], 30))
-                self.assertEqual((work / "hook.txt").read_text(encoding="utf-8"), "早起有多早？")
+                self.assertEqual((work / "hook.txt").read_text(encoding="utf-8"), "早起有多早")
                 self.assertNotIn("早起有多早", (work / "captions.srt").read_text(encoding="utf-8"))
-                self.assertIn("fontsize=84:fontcolor=0xFFDA20:borderw=0:bordercolor=black:x=(w-tw)/2:y=419-th/2", hook_filter)
+                self.assertIn("fontsize=90:fontcolor=0xFFDA20:borderw=0:bordercolor=black:x=(w-tw)/2:y=419-th/2", hook_filter)
                 (work / "render.mp4").touch()
 
             with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
@@ -91,7 +114,8 @@ class CutPlanTests(unittest.TestCase):
                     report = json.loads((destination / "剪辑记录.json").read_text(encoding="utf-8"))
                     self.assertEqual(report["speed"], 1.3)
                     self.assertEqual(report["layout"], EXPORT_LAYOUT)
-                    self.assertEqual(report["hook_title"], "早起有多早？")
+                    self.assertEqual(report["hook_title"], "早起有多早")
+                    self.assertEqual(report["hook_context"], "")
                     self.assertEqual(report["proofreading"]["input_mode"], "deepseek_audio_first")
                     self.assertEqual([d["reason"] for d in report["cut_decisions"]], ["复核静音"])
                     self.assertNotIn("replay", report)
@@ -243,7 +267,7 @@ class CutPlanTests(unittest.TestCase):
                 "source_size": 0, "source_words": [asdict(w) for w in tokens], "cut_decisions": decisions,
                 "proofreading": {"model": "test"}}), encoding="utf-8")
             restored, _, updated, keep, dropped, _, title = restore_source_edits(source, 4.1, 30, report, [decisions[0]["id"]])
-            self.assertIsNone(title)
+            self.assertEqual(title, {})
             self.assertEqual(restored, tokens)
             self.assertFalse(dropped)
             self.assertTrue(updated[0]["restored"])
@@ -444,7 +468,8 @@ class CutPlanTests(unittest.TestCase):
                                 "-c:v", "libx264", "-c:a", "aac", str(source)], check=True)
                 cue = {"start": 0, "end": 1, "text": "自己剪了过后自己配文案"}
                 write_burn_captions(root / "captions.ass", [cue], 16)
-                _, hook = prepare_hook(root, [], suggested_title="剪口播，能全自动吗？")
+                context = "每次录完都得自己剪" if width == 240 else ""
+                _, _, hook = prepare_hook(root, [], hook_title="剪口播，能全自动吗？", hook_context=context)
                 render(source, root, 0, Fraction(4), [(0, 4)], 3, hook)
                 data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(root / "render.mp4"),
                                                 "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
@@ -456,7 +481,8 @@ class CutPlanTests(unittest.TestCase):
                 white_cols = np.where(frame[960].min(axis=1) > 200)[0]
                 self.assertAlmostEqual(white_cols[0], 360, delta=4)
                 self.assertAlmostEqual(white_cols[-1], 719, delta=4)
-                for start, end, center in [(0, 550, 419), (1370, 1920, 1461)]:
+                head = [(0, 310, 255), (310, 550, 380)] if context else [(0, 550, 419)]
+                for start, end, center in head + [(1370, 1920, 1461)]:
                     rows = np.where(frame[start:end, :, :2].min(axis=2) > 150)[0]
                     self.assertAlmostEqual(start + (rows.min() + rows.max()) / 2, center, delta=3)
 

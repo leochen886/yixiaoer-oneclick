@@ -16,7 +16,7 @@ import numpy as np
 from PIL import ImageFont
 
 from koubo_deepseek import build_cut_plan, compact_silences
-from koubo_hook import HOOK_CHAR_LIMIT, prepare_hook
+from koubo_hook import HOOK_CHAR_LIMIT, hook_overlay, prepare_hook, previous_hook_overlay
 from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
                         nearby_speech_gaps, quiet_ranges, read_words, review_groups)
 from koubo_proofread import file_sha256, read_reference, review_captions
@@ -25,7 +25,8 @@ from transcribe_funasr import transcribe
 
 
 SPEED = Fraction(13, 10)
-EXPORT_LAYOUT = "portrait-1080x1920-center-4x3-v1"
+PREVIOUS_PORTRAIT_LAYOUT = "portrait-1080x1920-center-4x3-v1"
+EXPORT_LAYOUT = "portrait-1080x1920-center-4x3-v2"
 CAPTION_COLUMNS = 16
 
 
@@ -271,7 +272,8 @@ def restore_source_edits(source, duration, rate, report_path, restore_ids):
             dropped.update(range(first, last+1))
             edits.append({"reason": d["reason"], "text": "".join(w.text for w in words[first:last+1]),
                           "start": d["source_start"], "end": d["source_end"]})
-    return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits, saved.get("hook_title")
+    hook = {k: saved[k] for k in ("hook_title", "hook_context", "hook_evidence") if k in saved}
+    return words, saved["proofreading"], saved["cut_decisions"], keep, dropped, edits, hook
 
 
 def compact_word_clock(words, cuts, base_keep, fps):
@@ -300,9 +302,9 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
         work = Path(temp)
-        suggested_title = None
+        hook = {}
         if cut_report:
-            words, proof, decisions, keep, dropped, edits, suggested_title = restore_source_edits(
+            words, proof, decisions, keep, dropped, edits, hook = restore_source_edits(
                 source, duration, rate, cut_report, restore_ids)
         elif local_subtitles or asr_reference or deepseek_audio is False:
             words, proof, decisions, keep, dropped, edits = prepare_source_edits(
@@ -310,7 +312,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         else:
             plan = build_cut_plan(source, work / "原声记录", duration, rate,
                                   send_audio=True, min_pause=min_pause, hook_chars=HOOK_CHAR_LIMIT)
-            words, proof, decisions, keep, dropped, edits, suggested_title = restore_source_edits(
+            words, proof, decisions, keep, dropped, edits, hook = restore_source_edits(
                 source, duration, rate, plan, ())
         frames = round(duration * float(rate))
         if compact_pauses and not any(d["reason"] == "复核静音" for d in decisions):
@@ -350,8 +352,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         events = caption_events(timed, limit=CAPTION_COLUMNS, end_time=out_seconds)
         write_srt(work / "captions.srt", events)
         write_burn_captions(work / "captions.ass", events, CAPTION_COLUMNS)
-        hook_title, hook_filter = prepare_hook(work, retained, suggested_title=suggested_title,
-                                               replay_title=cut_report is not None)
+        hook_title, hook_context, hook_filter = prepare_hook(work, retained, **hook)
         proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
@@ -365,7 +366,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         (work / "render.mp4").rename(package / (name + ".mp4"))
         (work / "captions.srt").rename(package / (name + ".srt"))
         report = {"source": source.name, "source_size": source.stat().st_size, "hook_title": hook_title,
-                  "layout": EXPORT_LAYOUT,
+                  "layout": EXPORT_LAYOUT, "hook_context": hook_context,
                   "source_sha256": proof.get("source_sha256") or file_sha256(source),
                   "caption_coverage": coverage, "video_sha256": file_sha256(package / (name + ".mp4")),
                   "duration": duration, "output_duration": out_seconds,
@@ -436,13 +437,15 @@ def reproduce_legacy_hash(video, srt_bytes, info):
             if (work / "captions.srt").read_bytes() != srt_bytes:
                 raise ValueError("旧记录中的字幕与所选 SRT 不一致。")
         (work / "captions.srt").write_bytes(srt_bytes)
-        legacy_layout = info.get("layout") != EXPORT_LAYOUT
+        layout = info.get("layout")
+        legacy_layout = layout not in (EXPORT_LAYOUT, PREVIOUS_PORTRAIT_LAYOUT)
         write_burn_captions(work / "captions.ass", events, columns, legacy_layout=legacy_layout)
         overlay = None
         if info.get("hook_title"):
-            _, overlay = prepare_hook(work, [], suggested_title=info["hook_title"],
-                                      legacy_dimensions=(width, height) if legacy_layout else None,
-                                      replay_title=not legacy_layout)
+            if layout == EXPORT_LAYOUT:
+                overlay = hook_overlay(work, info["hook_title"], info.get("hook_context", ""))
+            else:
+                overlay = previous_hook_overlay(work, info["hook_title"], (width, height) if legacy_layout else None)
         modes = [False] if overlay else ([False, True] if info.get("display_cues") else [True])
         for legacy in modes:
             render(source.resolve(), work, index, rate, keep, round(info["output_duration"] * rate),

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -89,6 +90,31 @@ class FlashLengthTests(unittest.TestCase):
 
     def run_flash(self):
         return ask_flash(self.content, self.folder, self.limits)
+
+    def test_scoped_response_keeps_setup_question_and_evidence_together(self):
+        hook = dict(hook_context="每天早上都在赶车", hook_title="早起能省多少时间", hook_evidence="省十分钟")
+        self.post.side_effect = [response("first", "length", ""), response("second", "length", ""),
+                                 response("corr", "stop", json.dumps({**decisions(), **hook})),
+                                 response("rep", "stop", json.dumps(decisions())),
+                                 response("pause", "stop", json.dumps(decisions()))]
+        self.assertEqual(self.run_flash()["proposal"], {**decisions(), **hook})
+
+    def test_previous_heading_cache_requires_the_same_transcript(self):
+        self.post.return_value = response("ok", "stop", json.dumps(decisions()))
+        result = self.run_flash()
+        input_file = self.folder / "flash-input.json"
+        body = json.loads(input_file.read_text(encoding="utf-8"))
+        base, _, _ = body["messages"][0]["content"].partition("\n另返回三个字符串")
+        body["messages"][0]["content"] = base + "\n同时返回字符串 hook_title：根据保留下来的全文，写一句钩子。"
+        old_input = json.dumps(body, ensure_ascii=False)
+        input_file.write_text(old_input, encoding="utf-8")
+        result["input_sha256"] = hashlib.sha256(old_input.encode()).hexdigest()
+        (self.folder / "flash.json").write_text(json.dumps(result), encoding="utf-8")
+        self.assertEqual(self.run_flash(), result)
+        self.content["新原话"] = "内容已经改变"
+        with self.assertRaisesRegex(ValueError, "与本次盲测输入不同"):
+            self.run_flash()
+        self.post.assert_called_once()
 
     def test_length_discards_partial_even_if_parseable_and_retries_original_text(self):
         complete = decisions(pauses=[[1, .55, "拖长"]])

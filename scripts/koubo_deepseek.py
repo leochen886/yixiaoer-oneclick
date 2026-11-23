@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import requests
 
+from koubo_hook import HOOK_CHAR_LIMIT
 from koubo_plan import Word, kept_ranges, nearby_speech_gaps, quiet_ranges, read_words
 from koubo_proofread import ENDPOINT, MODEL, api_key, file_sha256, transcribe_deepseek
 
@@ -108,7 +109,8 @@ def collect_scoped_decisions(request, payload, limits):
                 pending.extend([(mid + 1, last), (first, mid)])
                 continue
             if not proposal.get("hook_title") and isinstance(batch.get("hook_title"), str):
-                proposal["hook_title"] = batch["hook_title"]
+                proposal.update({field: batch[field] for field in ("hook_title", "hook_context", "hook_evidence")
+                                 if field in batch})
             for row in batch[key]:
                 if not isinstance(row, list) or not row or type(row[0]) is not int:
                     raise ValueError(f"Flash 分批决策缺少有效编号（{scope}）。")
@@ -117,10 +119,18 @@ def collect_scoped_decisions(request, payload, limits):
     return proposal
 
 
-def ask_flash(content, records, limits, hook_chars=16):
-    hook_instruction = ("\n同时返回字符串 hook_title：根据保留下来的全文，写一句可以贯穿全片的口语化中文钩子。"
-                        f"控制在 {hook_chars} 个全角字以内（含标点），只写一行。抓住具体细节、反差或疑问，"
-                        "让没听过的人想听下去；保留原意，别剧透，别编造数字、结论或使用空泛套话。")
+def ask_flash(content, records, limits, hook_chars=HOOK_CHAR_LIMIT):
+    hook_instruction = (
+        "\n另返回三个字符串。先从会保留的口播选一个值得追问、后文确实会解释或展示的细节。"
+        "hook_evidence 原样摘录后文能回答或推进这个问题的一小句，用于本地核对，不上屏。"
+        "hook_title 是全片黄字，用观众自己的话问一个具体的未知：谁遇到了什么、为什么会这样、能不能做到或代价是多少。"
+        "观众读完应该说得出自己在等哪个答案。把结果留给口播，不要空问你知道吗或结果如何，不要编造矛盾或承诺。"
+        "hook_context 是可选的上方小白字。先尝试只写黄字；只有交代原片里的场景、对象或限制能让问题更好懂时才写白字，"
+        "否则返回空字符串。白字不能复述黄字或揭底。两行各成一句，都不写标点、表情、标签或换行。"
+        f"黄字通常 6 至 11 个全角字，白字和黄字合计最多 {hook_chars} 个全角字，两个半角字符折一字。"
+        "遇到数字、百分比或专名时选能保留原意的无标点写法。"
+        "例如只有原片讲的是自动剪口播时，白字可以是每次录完都得自己剪，黄字可以是剪口播能全自动吗。"
+        "本片必须依据本片原话重新拟题。")
     payload = {"model": MODEL, "thinking": {"type":"enabled"}, "reasoning_effort":"low",
                "max_tokens": 16000, "response_format":{"type":"json_object"},
                "messages":[{"role":"system","content":PROMPT},
@@ -136,7 +146,16 @@ def ask_flash(content, records, limits, hook_chars=16):
     if path.exists():
         result = read(path)
         if result["input_sha256"] not in (digest, previous_digest):
-            raise ValueError("记录中的 Flash 请求与本次盲测输入不同。")
+            # Reuse verified cuts from the previous heading format only for identical source inputs.
+            input_path = records / "flash-input.json"
+            old = read(input_path) if input_path.is_file() else {}
+            if digest_of(old) != result["input_sha256"]:
+                raise ValueError("记录中的 Flash 请求与本次盲测输入不同。")
+            old_system = old["messages"][0]["content"]
+            base, marker, _ = old_system.partition("\n同时返回字符串 hook_title：根据保留下来的全文")
+            old["messages"][0]["content"] = base
+            if not marker or digest_of(old) != previous_digest:
+                raise ValueError("记录中的 Flash 请求与本次盲测输入不同。")
         return result
     save(records / "flash-input.json", payload)
     headers = {"Authorization": "Bearer " + api_key()}
@@ -538,7 +557,7 @@ def select_cuts(anchors, owners, gaps, proposal, meta, wav):
     return sorted(cuts,key=lambda d:d["frames"]), audit
 
 
-def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35, hook_chars=16):
+def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35, hook_chars=HOOK_CHAR_LIMIT):
     records.mkdir(exist_ok=True, parents=True)
     digest = file_sha256(source)
     wav = records / "原声音轨.wav"
@@ -587,7 +606,8 @@ def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35
         proof["flash_attempts"] = flash["attempts"]
     plan = {"source":source.name,"source_size":source.stat().st_size,"fps":str(rate),"duration":duration,
             "cut_decisions":cuts,"source_words":[asdict(w) for w in timed],"proofreading":proof,
-            "hook_title":proposal.get("hook_title")}
+            "hook_title":proposal.get("hook_title"), "hook_context":proposal.get("hook_context"),
+            "hook_evidence":proposal.get("hook_evidence") or ""}
     path = records / "原片剪点.json"
     save(path,plan)
     print(f"原声词 {len(anchors)} 个，云端校字 {sum(r['applied'] for r in correction_audit)} 项，"
