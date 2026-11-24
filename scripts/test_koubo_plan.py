@@ -11,10 +11,11 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import Mock, patch
 from requests.exceptions import ChunkedEncodingError
-from koubo import (EXPORT_LAYOUT, check_caption_coverage, export, is_exported_video,
+from koubo import (EXPORT_LAYOUT, check_caption_coverage, export, find_reusable_export, is_exported_video,
                    main as cut_main, render, restore_source_edits, verified_export_hash, write_burn_captions)
 from koubo_deepseek import apply_corrections, clock_transcript, resolve_span, spoken, supplement_hearing
-from koubo_hook import clean_line, prepare_hook, previous_hook_overlay
+from koubo_hook import (HOOK_EDITOR_VERSION, clean_line, edit_hook, is_question,
+                        prepare_hook, previous_hook_overlay)
 from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
 
@@ -74,6 +75,49 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(local.call_count, 2)
                 cloud.assert_not_called()
 
+    @patch("koubo_hook.api_key", return_value="test")
+    @patch("koubo_hook.requests.post")
+    def test_editor_prefers_a_supported_angle_over_keyword_questions(self, post, _key):
+        for title in ["为什么提到良言", "按每股涨多少", "这哪里是个人呐", "为什么提到教主", "AI是这么怎么一回事儿"]:
+            self.assertFalse(is_question(title))
+        evidence = "最佳导演我投给小川"
+        tokens = [Word("教主回归", 0, 1, True, False), Word(evidence, 1, 2, True, False)]
+        def reply(rows):
+            return {"id": "heading", "choices": [{"finish_reason": "stop", "message": {
+                "content": json.dumps({"summary": "作者用颁奖调侃教主回归。", "candidates": rows}, ensure_ascii=False)}}]}
+        post.return_value.json.side_effect = [
+            reply([{"title": "为什么提到教主", "quote": evidence}]),
+            reply([{"title": "谁来给老黄颁奖", "quote": "已经剪掉的台词"},
+                   {"title": "导演投给小川吗", "quote": evidence},
+                   {"title": "教主回归谁拿最佳导演", "quote": evidence, "context": ""}])]
+        result = edit_hook(tokens)
+        self.assertEqual((result["hook_title"], result["hook_context"], result["hook_evidence"]),
+                         ("教主回归谁拿最佳导演", "", evidence))
+        self.assertEqual(result["hook_summary"], "作者用颁奖调侃教主回归。")
+        self.assertEqual(result["hook_editor"]["request_id"], "heading")
+        self.assertEqual((result["hook_editor"]["round"], result["hook_editor"]["rank"]), (2, 3))
+        retry = json.loads(post.call_args.kwargs["json"]["messages"][1]["content"])
+        self.assertIn("教主回归", retry["成片口播"])
+        self.assertIn("为什么提到教主", str(retry["上一轮未采用（请重新写）"]))
+        self.assertEqual(post.call_count, 2)
+
+    def test_offline_long_unpunctuated_speech_uses_an_audible_excerpt(self):
+        text = "昨天大家排了两个小时的队才领到一张下个礼拜才能用的预约单"
+        tokens = [Word(ch, i / 5, (i + 1) / 5, False, False) for i, ch in enumerate(text)]
+        with tempfile.TemporaryDirectory() as tmp:
+            title, _, _ = prepare_hook(Path(tmp), tokens)
+        self.assertTrue(title)
+        self.assertIn(title, text)
+
+    @patch("koubo_hook.api_key", return_value="test")
+    @patch("koubo_hook.requests.post")
+    def test_editor_exhaustion_never_burns_a_generic_title(self, post, _key):
+        post.return_value.json.return_value = {"choices": [{"finish_reason": "stop", "message": {
+            "content": '{"summary":"作者劝大家别跟风。","candidates":[{"title":"为什么提到良言","quote":"良言难劝啊"}]}'}}]}
+        with self.assertRaisesRegex(ValueError, "两轮黄字"):
+            edit_hook([Word("良言难劝啊", 0, 1, True, False)])
+        self.assertEqual(post.call_count, 2)
+
     def test_both_entry_points_compact_raw_video_and_reuse_the_selected_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -105,7 +149,10 @@ class CutPlanTests(unittest.TestCase):
                 self.assertIn("fontsize=90:fontcolor=0xFFDA20:borderw=0:bordercolor=black:x=(w-tw)/2:y=419-th/2", hook_filter)
                 (work / "render.mp4").touch()
 
+            edited = {"hook_title":"早起有多早", "hook_context":"", "hook_evidence":"早",
+                      "hook_editor":{"version": HOOK_EDITOR_VERSION}}
             with patch("koubo.probe", side_effect=probe_video), patch("koubo.render", side_effect=mock_render), \
+                    patch("koubo.edit_hook", return_value=edited) as editor, \
                     patch("koubo.compact_silences", return_value=[(13,52)]) as compact, \
                     patch("koubo.build_cut_plan", side_effect=mock_plan) as build:
                 for extra in ([], ["--publish-path-file",str(path_file)]):
@@ -127,6 +174,7 @@ class CutPlanTests(unittest.TestCase):
                 self.assertEqual(path_file.with_suffix(".publish-key").read_text(), hashlib.sha256(b"").hexdigest())
                 self.assertEqual(build.call_count, 2)
                 self.assertEqual(compact.call_count, 2)
+                self.assertEqual(editor.call_count, 2)
 
     def test_replay_checks_source_digest_even_when_size_and_name_match(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -631,6 +679,66 @@ class CutPlanTests(unittest.TestCase):
         ref = [{"start": 1.2, "end": 3.1, "text": "来哥这我完成了"}]
         _, added = add_missing_cues(events, ref, "前句。来哥，任务完成了。后句。")
         self.assertEqual(added, [{"start": 1.2, "end": 2.9, "text": "来哥任务完成了"}])
+
+    def test_reuse_existing_export_and_preserve_cache_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "clip.mp4"
+            source.write_bytes(b"raw-video")
+            out_dir = root / "output"
+            rate = Fraction(30)
+
+            def mock_plan(video, records, duration, fps, *, send_audio, min_pause, hook_chars):
+                records.mkdir(parents=True, exist_ok=True)
+                (records / "asr.json").write_text("{}", encoding="utf-8")
+                plan = records / "plan.json"
+                plan.write_text(json.dumps({
+                    "source": video.name, "fps": str(fps), "duration": duration,
+                    "cut_decisions": [], "source_words": [asdict(w) for w in words("好", [[0, 300]])],
+                    "proofreading": {"input_mode": "deepseek_audio_first"}, "hook_title": "测试标题",
+                }), encoding="utf-8")
+                return plan
+
+            with patch("koubo.probe", return_value=(0, 1.0, rate)), \
+                    patch("koubo.build_cut_plan", side_effect=mock_plan), \
+                    patch("koubo.edit_hook", return_value={"hook_title":"早起有多早", "hook_context":""}), \
+                    patch("koubo.compact_silences", return_value=[]), \
+                    patch("koubo.render", side_effect=RuntimeError("ffmpeg boom")):
+                with self.assertRaisesRegex(RuntimeError, "ffmpeg boom"):
+                    export(source, out_dir, .35)
+
+            cache_dir = out_dir / ".cache" / hashlib.sha256(b"raw-video").hexdigest()[:16]
+            self.assertTrue((cache_dir / "asr.json").is_file())
+
+            cut_folder = out_dir / "clip_cut"
+            cut_folder.mkdir(parents=True)
+            cut_mp4 = cut_folder / "clip_cut.mp4"
+            cut_mp4.write_bytes(b"cut-mp4")
+            cut_srt = cut_folder / "clip_cut.srt"
+            cut_srt.write_text("1\n00:00:00,000 --> 00:00:00,800\n好\n\n", encoding="utf-8")
+            report = {
+                "source": "clip.mp4",
+                "source_sha256": hashlib.sha256(b"raw-video").hexdigest(),
+                "video_sha256": hashlib.sha256(b"cut-mp4").hexdigest(),
+                "speed": 1.3,
+                "keep": [[0, 1]],
+                "output_duration": 1.0,
+                "proofreading": {"srt_sha256": hashlib.sha256(cut_srt.read_bytes()).hexdigest()},
+            }
+            (cut_folder / "剪辑记录.json").write_text(json.dumps(report), encoding="utf-8")
+            handoff = root / "handoff.txt"
+            with patch("koubo.probe", return_value=(0, 1.0, rate)):
+                self.assertIsNone(find_reusable_export(source, out_dir, handoff=handoff))
+                self.assertFalse(handoff.with_suffix(".srt").exists())
+                report["layout"] = EXPORT_LAYOUT
+                (cut_folder / "剪辑记录.json").write_text(json.dumps(report), encoding="utf-8")
+                self.assertIsNone(find_reusable_export(source, out_dir, handoff=handoff))
+                report["hook_editor"] = {"version": HOOK_EDITOR_VERSION}
+                (cut_folder / "剪辑记录.json").write_text(json.dumps(report), encoding="utf-8")
+                reused = find_reusable_export(source, out_dir, handoff=handoff)
+            self.assertIsNotNone(reused)
+            self.assertEqual(reused[0], cut_mp4)
+            self.assertEqual(handoff.with_suffix(".publish-key").read_text(), report["source_sha256"])
 
 
 if __name__ == "__main__":

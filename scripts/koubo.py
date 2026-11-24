@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import asdict, replace
@@ -16,7 +17,8 @@ import numpy as np
 from PIL import ImageFont
 
 from koubo_deepseek import build_cut_plan, compact_silences
-from koubo_hook import HOOK_CHAR_LIMIT, hook_overlay, prepare_hook, previous_hook_overlay
+from koubo_hook import (HOOK_CHAR_LIMIT, HOOK_EDITOR_VERSION, edit_hook, hook_overlay,
+                        prepare_hook, previous_hook_overlay)
 from koubo_plan import (Word, align_reviewed_words, caption_events, kept_ranges, make_plan, map_kept_words,
                         nearby_speech_gaps, quiet_ranges, read_words, review_groups)
 from koubo_proofread import file_sha256, read_reference, review_captions
@@ -300,6 +302,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         compact_pauses = cut_report is None
     idx, duration, rate = probe(source)
     root.mkdir(parents=True, exist_ok=True)
+    cache_dir = None
     with tempfile.TemporaryDirectory(dir=root, prefix=".koubo-") as temp:
         work = Path(temp)
         hook = {}
@@ -310,7 +313,10 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
             words, proof, decisions, keep, dropped, edits = prepare_source_edits(
                 source, work, duration, rate, min_pause, local_subtitles, asr_reference)
         else:
-            plan = build_cut_plan(source, work / "原声记录", duration, rate,
+            cache_root = root / ".cache"
+            cache_root.mkdir(parents=True, exist_ok=True)
+            cache_dir = cache_root / file_sha256(source)[:16]
+            plan = build_cut_plan(source, cache_dir, duration, rate,
                                   send_audio=True, min_pause=min_pause, hook_chars=HOOK_CHAR_LIMIT)
             words, proof, decisions, keep, dropped, edits, hook = restore_source_edits(
                 source, duration, rate, plan, ())
@@ -352,7 +358,16 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         events = caption_events(timed, limit=CAPTION_COLUMNS, end_time=out_seconds)
         write_srt(work / "captions.srt", events)
         write_burn_captions(work / "captions.ass", events, CAPTION_COLUMNS)
-        hook_title, hook_context, hook_filter = prepare_hook(work, retained, **hook)
+        heading_record = {}
+        if cache_dir is not None:
+            print("正在用成片口播单独拟黄字，核对候选标题和原话…", flush=True)
+            heading_record = edit_hook(retained, hook.get("hook_title"))
+            hook_title, hook_context = heading_record["hook_title"], heading_record["hook_context"]
+            hook_filter = hook_overlay(work, hook_title, hook_context)
+        else:
+            hook_title, hook_context, hook_filter = prepare_hook(work, retained, **hook)
+            if hook_title == hook.get("hook_title") and hook.get("hook_evidence"):
+                heading_record["hook_evidence"] = hook["hook_evidence"]
         proof.setdefault("input_mode", "explicit_reference" if asr_reference else "source_video_only")
         proof["srt_sha256"] = hashlib.sha256((work / "captions.srt").read_bytes()).hexdigest()
         print(f"原片 {duration:.2f} 秒，{float(SPEED)} 倍速成片 {out_seconds:.2f} 秒。正在导出…", flush=True)
@@ -365,7 +380,7 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
         package.mkdir()
         (work / "render.mp4").rename(package / (name + ".mp4"))
         (work / "captions.srt").rename(package / (name + ".srt"))
-        report = {"source": source.name, "source_size": source.stat().st_size, "hook_title": hook_title,
+        report = {**heading_record, "source": source.name, "source_size": source.stat().st_size, "hook_title": hook_title,
                   "layout": EXPORT_LAYOUT, "hook_context": hook_context,
                   "source_sha256": proof.get("source_sha256") or file_sha256(source),
                   "caption_coverage": coverage, "video_sha256": file_sha256(package / (name + ".mp4")),
@@ -388,6 +403,8 @@ def export(source, root, min_pause, local_subtitles=False, asr_reference=None, d
                 continue
             try:
                 package.rename(destination)
+                if cache_dir is not None and cache_dir.exists():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
                 return destination
             except OSError:
                 # Windows can report access denied when another export already
@@ -502,6 +519,41 @@ def is_exported_video(video):
     return bool(verified_export_hash(video))
 
 
+def find_reusable_export(source, output_dir, *, handoff=None):
+    if not output_dir.is_dir():
+        return None
+    source_hash = file_sha256(source)
+    stem = source.stem
+    prefix = stem + "_cut"
+    candidates = [
+        d for d in output_dir.iterdir()
+        if d.is_dir() and (d.name == prefix or d.name.startswith(prefix + "_"))
+    ]
+    candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for folder in candidates:
+        candidate = folder / (prefix + ".mp4")
+        report_path = folder / "剪辑记录.json"
+        if not candidate.is_file() or not report_path.is_file():
+            continue
+        try:
+            info = json.loads(report_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        expected_src = info.get("source_sha256") or info.get("proofreading", {}).get("source_sha256")
+        if expected_src != source_hash or info.get("speed") != float(SPEED):
+            continue
+        editor = info.get("hook_editor")
+        if not isinstance(editor, dict) or editor.get("version") != HOOK_EDITOR_VERSION:
+            continue
+        try:
+            digest = verified_export_hash(candidate, handoff=handoff, from_source=True)
+        except ValueError:
+            continue
+        if digest:
+            return candidate, digest
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", nargs="?", help="口播原片路径")
@@ -509,6 +561,7 @@ def main():
     parser.add_argument("--min-pause", type=float, default=0.35, help="开始检查停顿的秒数（默认 0.35）")
     parser.add_argument("--open-folder", action="store_true", help="完成后在资源管理器中打开成片目录")
     parser.add_argument("--publish-path-file", type=Path, help="为发布入口准备视频，并写回本次成片的绝对路径")
+    parser.add_argument("--reuse-existing", action="store_true", help="存在同原片且校验通过的已剪成片时直接复用")
     parser.add_argument("--cut-report", type=Path, help="沿用原片的剪点与自动校对稿，在本机重新导出")
     parser.add_argument("--restore-cut", action="append", default=[], help="恢复指定剪点 ID，可重复使用")
     parser.add_argument("--compact-pauses", action="store_true", default=None,
@@ -545,14 +598,21 @@ def main():
             destination = video.parent
             print("已核对成片和同名字幕，直接使用所选版本。")
         else:
-            destination = export(source, args.output_dir.absolute(), args.min_pause,
-                                 args.local_subtitles, args.asr_reference, args.deepseek_audio,
-                                 args.cut_report, args.restore_cut, compact_pauses=args.compact_pauses)
-            video = destination / (source.stem + "_cut.mp4")
-            if args.publish_path_file:
-                digest = verified_export_hash(video, handoff=args.publish_path_file, from_source=True)
-                if not digest:
-                    raise ValueError("导出的成片未通过核对，已停止准备发布。")
+            reused = (find_reusable_export(source, args.output_dir.absolute(), handoff=args.publish_path_file)
+                      if args.reuse_existing and args.publish_path_file else None)
+            if reused:
+                video, digest = reused
+                destination = video.parent
+                print(f"发现同一原片已剪好的成片，直接复用：{video}")
+            else:
+                destination = export(source, args.output_dir.absolute(), args.min_pause,
+                                     args.local_subtitles, args.asr_reference, args.deepseek_audio,
+                                     args.cut_report, args.restore_cut, compact_pauses=args.compact_pauses)
+                video = destination / (source.stem + "_cut.mp4")
+                if args.publish_path_file:
+                    digest = verified_export_hash(video, handoff=args.publish_path_file, from_source=True)
+                    if not digest:
+                        raise ValueError("导出的成片未通过核对，已停止准备发布。")
         if args.publish_path_file:
             args.publish_path_file.with_suffix(".sha256").write_text(digest, encoding="ascii")
             args.publish_path_file.write_text(str(video), encoding="utf-8")
