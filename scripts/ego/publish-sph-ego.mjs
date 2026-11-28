@@ -3,18 +3,18 @@
 // 输入：本次发布目录的 ego-input.json，通过模块 URL 的 input 参数传入。
 //   { videoPath, title, desc, tags, noPublish }
 // 输出：RESULT=... 供桌面入口区分表单失败、点击、平台回执与预演。
+import { ensureLogin, showWindow } from "./ensure-login.mjs";
 import { declareOriginal, fillShortTitle, publishFromForm } from "./sph-publish-form.mjs";
-
-import { findPost, postKey, readPostRows, verifyAssistant } from "./sph-posts.mjs";
+import { computeAgeAndStage, computeEngagement, findPost, matchesPost, postKey, readPostRows } from "./sph-posts.mjs";
 import { submission } from "./submission.mjs";
 
 const fs = await import("node:fs/promises");
 const path = await import("node:path");
 const { fileURLToPath } = await import("node:url");
+const { randomUUID } = await import("node:crypto");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INPUT_PATH = new URL(import.meta.url).searchParams.get("input") || path.join(__dirname, "publish-sph-ego-input.json");
-const ASSISTANT_HOME = "https://channels.weixin.qq.com/platform";
 const LIST_URL = "https://channels.weixin.qq.com/platform/post/list";
 const CREATE_URL = "https://channels.weixin.qq.com/platform/post/create";
 
@@ -31,18 +31,6 @@ async function shadowText(page) {
   });
 }
 
-async function showWindow(task, page) {
-  try {
-    const win = await task.cdp("Browser.getWindowForTarget", { targetId: page.targetId });
-    if (win.bounds?.windowState === "minimized") {
-      await task.cdp("Browser.setWindowBounds", { windowId: win.windowId, bounds: { windowState: "normal" } });
-    }
-  } catch (e) {
-    console.log("EGO_WINDOW " + e.message);
-  }
-  await page.cdp("Page.bringToFront").catch(e => console.log("EGO_FOREGROUND " + e.message));
-}
-
 async function waitForShadowText(page, text, present, timeout) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -52,6 +40,73 @@ async function waitForShadowText(page, text, present, timeout) {
     await page.waitForTimeout(3000);
   }
   throw new Error("timeout waiting for shadow text: " + text);
+}
+
+// 顺手把首屏可见的其他已发布视频最新数据同步写入对应目录的 live-metrics.json（零额外翻页成本）
+async function syncVisibleRuns(page, currentRunDir) {
+  try {
+    const rows = await page.evaluate(readPostRows);
+    if (!rows || !rows.length) return;
+    const runsRoot = path.dirname(currentRunDir);
+    const currentName = path.basename(currentRunDir);
+    const entries = await fs.readdir(runsRoot, { withFileTypes: true });
+    let synced = 0;
+    const now = new Date();
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === currentName || entry.name === ".submissions") continue;
+      const dir = path.join(runsRoot, entry.name);
+      const retroFile = path.join(dir, "retro.json");
+      let retro;
+      try {
+        retro = JSON.parse(await fs.readFile(retroFile, "utf8"));
+      } catch {
+        continue;
+      }
+      const hits = rows.filter((r) => matchesPost(r, retro));
+      if (hits.length !== 1) continue;
+      const hit = hits[0];
+      const engagement = computeEngagement(hit.metrics);
+      const { ageHours, stage } = computeAgeAndStage(retro.capturedAt, now);
+      const liveData = {
+        capturedAt: now.toISOString(),
+        stage,
+        ageHours,
+        post: { id: hit.id || null, title: hit.title || "", time: hit.time || "" },
+        rawMetrics: hit.metrics,
+        parsedMetrics: {
+          plays: engagement.plays,
+          likes: engagement.likes,
+          comments: engagement.comments,
+          shares: engagement.shares,
+          saves: engagement.saves,
+        },
+        engagement: {
+          interactions: engagement.interactions,
+          interactionRate: engagement.interactionRate,
+          likeRate: engagement.likeRate,
+          commentRate: engagement.commentRate,
+          shareRate: engagement.shareRate,
+          saveRate: engagement.saveRate,
+        },
+      };
+      const liveFile = path.join(dir, "live-metrics.json");
+      const tmpLive = liveFile + "." + randomUUID() + ".tmp";
+      await fs.writeFile(tmpLive, JSON.stringify(liveData, null, 2), "utf8");
+      await fs.rename(tmpLive, liveFile);
+
+      if (hit.id && !retro.postId) {
+        retro.postId = hit.id;
+        const tmpRetro = retroFile + "." + randomUUID() + ".tmp";
+        await fs.writeFile(tmpRetro, JSON.stringify(retro, null, 2), "utf8");
+        await fs.rename(tmpRetro, retroFile);
+      }
+      synced += 1;
+    }
+    if (synced > 0) console.log("LIVE_SYNC_COUNT=" + synced);
+  } catch (e) {
+    console.log("LIVE_SYNC_SKIP " + (e && e.message ? e.message : String(e)));
+  }
 }
 
 // 发布后核对本次新增的作品及其时间，并保存复盘基线。
@@ -68,12 +123,14 @@ async function captureRetro(page, input, before) {
   if (!before) return;
   await page.goto(LIST_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   const chosen = await findPost(page, retro, { latest: true, timeout: 90000, exclude: before });
-  if (!chosen) return;
-  Object.assign(retro, { postId: chosen.id || null, matchMethod: chosen.id ? "post-id" : "text-and-time",
-    matchedTitle: chosen.title, publishDate: chosen.time, metricsAtPublish: chosen.metrics });
-  await fs.writeFile(file + ".tmp", JSON.stringify(retro, null, 2), "utf8");
-  await fs.rename(file + ".tmp", file);
-  console.log("RETRO_CAPTURED method=" + retro.matchMethod);
+  if (chosen) {
+    Object.assign(retro, { postId: chosen.id || null, matchMethod: chosen.id ? "post-id" : "text-and-time",
+      matchedTitle: chosen.title, publishDate: chosen.time, metricsAtPublish: chosen.metrics });
+    await fs.writeFile(file + ".tmp", JSON.stringify(retro, null, 2), "utf8");
+    await fs.rename(file + ".tmp", file);
+    console.log("RETRO_CAPTURED method=" + retro.matchMethod);
+  }
+  await syncVisibleRuns(page, input.runDir);
 }
 
 async function main() {
@@ -95,31 +152,12 @@ async function main() {
     console.log("EGO_SPACE=" + task.spaceId + " " + SPACE);
     await showWindow(task, page);
     // 1) 打开视频号助手，判断登录态
-    await page.goto(ASSISTANT_HOME, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(3000);
-    let url = await page.url();
-
-    // 未登录 -> 需要扫码
-    if (url.includes("/login") || url.includes("oauth-callback")) {
-      console.log("[登录检测] 未登录，需要扫码：请在弹出的浏览器窗口里用微信扫码登录（最多等 5 分钟）");
-      await showWindow(task, page);
-      const deadline = Date.now() + 300000; // 最多等 5 分钟
-      let loggedIn = false;
-      while (Date.now() < deadline) {
-        await page.waitForTimeout(5000);
-        url = await page.url();
-        if (url.includes("/platform") && !url.includes("/login") && !url.includes("oauth-callback")) {
-          loggedIn = true;
-          break;
-        }
-      }
-      if (!loggedIn) {
-        console.log("RESULT=FAIL 登录超时，未完成扫码");
-        return;
-      }
-      console.log("[登录检测] 扫码成功，已登录");
+    try {
+      await ensureLogin(task, page);
+    } catch (loginErr) {
+      console.log("RESULT=FAIL " + (loginErr && loginErr.message ? loginErr.message : String(loginErr)).split("\n")[0]);
+      return;
     }
-    await verifyAssistant(page);
 
     if (attempt) {
       try {

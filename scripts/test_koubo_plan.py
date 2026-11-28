@@ -18,6 +18,7 @@ from koubo_hook import (HOOK_EDITOR_VERSION, clean_line, edit_hook, is_question,
                         prepare_hook, previous_hook_overlay)
 from koubo_plan import Word, align_reviewed_words, caption_events, display_width, make_events, make_plan, read_words, wrap_caption
 from koubo_proofread import ReviewTruncated, add_missing_cues, align_hearing, apply_review_edits, compatible, project_reference, review_captions, transcribe_deepseek
+import requests
 
 
 def words(text, spans):
@@ -25,6 +26,44 @@ def words(text, spans):
 
 
 class CutPlanTests(unittest.TestCase):
+    def test_english_contraction_keeps_one_anchor_and_sentence_boundaries(self):
+        text = "教主。I don't care, 爱咋咋地。"
+        raw = "教 主 i don't care 爱 咋 咋 地"
+        times = [[i * 200, (i + 1) * 200] for i in range(9)]
+        for item in ({"text": text, "raw_text": raw}, {"text": text.replace("'", "’")}):
+            with self.subTest(item=item):
+                found = read_words([{**item, "timestamp": times}])
+                self.assertEqual([w.text.replace("’", "'") for w in found], ["教","主","I","don't","care","爱","咋","咋","地"])
+                self.assertEqual([(w.start, w.end) for w in found], [(a/1000, b/1000) for a,b in times])
+                self.assertTrue(found[2].sentence_start)
+                self.assertFalse(found[3].new_clause)
+                self.assertTrue(found[5].new_clause)
+                self.assertTrue(found[5].space)
+
+    def test_recognizer_units_override_surface_guess_and_reject_unmatched_text(self):
+        times = [[0,200], [220,400], [400,600]]
+        sample = {"text":"AB，CD", "raw_text":"A B CD", "timestamp":times}
+        self.assertEqual([w.text for w in read_words([sample])], ["A","B","CD"])
+        for invalid in ({"raw_text":"A CD"}, {"raw_text":"A X CD"}, {"text":"AB，CD了"},
+                        {"timestamp":[[0,200],[180,400],[400,600]]}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                read_words([sample | invalid])
+
+    def test_display_formatting_cannot_move_acoustic_boundaries(self):
+        tokens = ["看", "AI", "don't", "re-test", "1.5%", "C++", "再", "说"]
+        times = [[i * 500 + 11, i * 500 + 269] for i in range(len(tokens))]
+        for text in ("看。AI don't re-test 1.5% C++，再说",
+                     "看！Ａ Ｉ ｄｏｎ ’ ｔ ｒｅ‑ｔｅｓｔ １．５％ Ｃ＋＋，再说"):
+            with self.subTest(text=text):
+                found = read_words([{"text": text, "raw_text": " ".join(tokens), "timestamp": times}])
+                self.assertEqual([w.text for w in found], tokens)
+                self.assertEqual([(w.start,w.end) for w in found], [(a/1000,b/1000) for a,b in times])
+                self.assertTrue(found[1].sentence_start)
+                self.assertTrue(found[-2].new_clause)
+        for changed in ("15%", "0.5%", "1.5万"):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                read_words([{"text": changed, "raw_text": "1.5%", "timestamp": [[100,250]]}])
+
     def test_offline_hook_uses_the_recording_and_matches_the_portrait_preview(self):
         tokens = [Word("为什么越浇越蔫", 0, 1, True, False),
                   Word("花怎么养", 1, 2, True, False)]
@@ -679,6 +718,48 @@ class CutPlanTests(unittest.TestCase):
         ref = [{"start": 1.2, "end": 3.1, "text": "来哥这我完成了"}]
         _, added = add_missing_cues(events, ref, "前句。来哥，任务完成了。后句。")
         self.assertEqual(added, [{"start": 1.2, "end": 2.9, "text": "来哥任务完成了"}])
+
+    def test_supplement_hearing_keeps_arabic_numbers_and_percentages(self):
+        spoken_text = "从一百一十一点五跌百分之二十"
+        raw = words(spoken_text, [(i * 250, (i + 1) * 250) for i in range(len(spoken_text))])
+        main = "从111.5跌20%"
+        fixed, repairs = supplement_hearing([{"start": 0, "end": 4.0, "text": main}], raw)
+        self.assertEqual(fixed[0]["text"], main)
+        self.assertEqual(repairs, [])
+
+    def test_glossary_allows_english_misspelling_fix_while_blocking_transliteration(self):
+        sentences = [(0, "那个Sorpic和Cloud很火。")]
+        corrected, audit = apply_corrections(
+            sentences,
+            [[1, "Sorpic", "Anthropic", "专名"], [1, "Cloud", "Claude", "专名"], [1, "Anthropic", "安索皮克", "音译"]],
+            protected_names={"sorpic", "cloud"},
+            glossary_terms={"anthropic", "claude"},
+        )
+        self.assertEqual([r["applied"] for r in audit], [True, True, False])
+        self.assertEqual(corrected[0], "那个Anthropic和Claude很火。")
+
+    def test_clock_transcript_includes_final_word_on_chunk_end_boundary(self):
+        raw = words("你好吗", [[0, 300], [300, 600], [900, 1100]])
+        timed, owners = clock_transcript([{"start": 0.0, "end": 1.0}], [(0, "你好吗")], ["你好吗"], raw)
+        self.assertEqual(owners, [0, 1, 2])
+        self.assertEqual("".join(w.text for w in timed), "你好吗")
+
+    @patch("koubo_proofread.time.sleep")
+    @patch("koubo_proofread.api_key", return_value="test")
+    @patch("koubo_proofread.requests.post")
+    def test_transcribe_deepseek_retries_transient_errors(self, post, _key, sleep):
+        ok_resp = Mock(status_code=200)
+        ok_resp.json.return_value = {"request_id": "ok-1", "text": "重试成功"}
+        post.side_effect = [requests.exceptions.ReadTimeout("slow"), Mock(status_code=503), ok_resp]
+        with tempfile.TemporaryDirectory() as tmp:
+            wav = Path(tmp) / "audio.wav"
+            with wave.open(str(wav), "wb") as out:
+                out.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+                out.writeframes(bytes(2 * 32000))
+            receipt = transcribe_deepseek(wav, [])
+        self.assertEqual(receipt["text"], "重试成功")
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_reuse_existing_export_and_preserve_cache_on_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

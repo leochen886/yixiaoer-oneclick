@@ -7,8 +7,8 @@
 - **提醒**：开会话时自动提醒「哪些视频发了 ≥3 天还没复盘」。
 
 ```
-发布：原片 → 剪口播 → 带字幕成片与 SRT → AI 文案 → ego 浏览器上传发表 → 自动留档（retro.json + 口播文案）
-复盘：3 天后 → review-sph.ps1 "视频名" → 抓数据 + 评论 → report.md
+发布：原片 → 查重校验 → 剪口播（带专属词表与历史经验） → 带字幕成片与 SRT → AI 文案 → ego 浏览器上传发表 → 自动留档（retro.json + 口播文案）
+复盘：双击 视频号一键复盘.cmd（或 review-all-sph.ps1）→ 批量抓数据 + 评论 → 复盘看板.html + 复盘总览.md + 账号经验小本本（自动反哺下次盲发）
 ```
 
 ---
@@ -99,7 +99,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\oneclick-sph-ego.ps1
 
 ## 复盘
 
-发布 3 天后，看这条跑得怎么样：
+### 1. 一键全量复盘（推荐）
+
+直接双击根目录的 `视频号一键复盘.cmd`（或命令行运行）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-all-sph.ps1
+```
+
+它会自动筛选所有新发布、或刚跨过 1 天 / 3 天 / 7 天节点的作品，一次性拉回最新播放 / 点赞 / 评论 / 转发 / 收藏、互动率以及热门评论，并自动生成：
+
+- **可视化看板**：`publish-runs/复盘看板.html`（会自动打开，包含核心数字、红黑榜、大白话诊断与下期选题建议）
+- **文字总览**：`publish-runs/复盘总览.md`
+- **账号经验小本本**：`publish-runs/account-playbook.json`（下次一键发布时自动注入给 AI 起顶部黄字和发布文案）
+
+如果需要强行重拉全部近期作品或仅离线重算看板，可加参数：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-all-sph.ps1 -All
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-all-sph.ps1 -AnalyzeOnly
+```
+
+### 2. 单条复盘
+
+也可以单独查某一条视频：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-sph.ps1 "视频名"
@@ -107,11 +130,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-sph.ps1 "视�
 
 `视频名` 是视频文件名（或 `publish-runs` 目录名片段，模糊匹配）。脚本会复用已登录的 ego 浏览器，到视频号助手找到那条作品，生成 `report.md`，内容包含：
 
-- **数据**：播放 / 点赞 / 评论 / 转发 / 收藏（含发布时 vs 现在 vs 增量）
+- **数据**：播放 / 点赞 / 评论 / 转发 / 收藏（含发布时 vs 现在 vs 增量 + 互动率）
 - **口播文案**：发布时留档的完整文案，方便对着数据按内容拆解
 - **评论**：Top 20 热门评论
 
 报告位置：`publish-runs/<时间戳>_<视频名>/report.md`。
+
+## 专属词表（可选）
+
+根目录的 `koubo-glossary.json` 维护常用专名规范写法（如 `Claude`、`Anthropic`、`Gemini`、`DeepSeek` 等）与常见听错映射。你可以随时打开编辑增删，剪口播校字时会自动按词表修正专名拼写。
 
 ---
 
@@ -144,19 +171,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\review-sph.ps1 "视�
 ## 目录结构
 
 ```
+├── 剪口播.cmd                单独剪辑预览入口（可拖拽视频）
 ├── 视频号一键发布.cmd        一键发布入口（可拖拽视频）
+├── 视频号一键复盘.cmd        一键批量复盘入口（生成看板与经验小本本）
 ├── oneclick-config.json      一键发布配置
-├── publish-runs/             每次发布的运行记录（日志、retro.json、文案、报告）
+├── koubo-glossary.json       口播专属词表（专名拼写与常见误识对照）
+├── publish-runs/             每次发布的运行记录（日志、retro.json、快照、复盘看板、经验库）
 ├── scripts/
+│   ├── koubo*.py             剪口播、DeepSeek 校字与顶部黄字模块
 │   ├── oneclick-sph-ego.ps1  一键发布编排脚本（ego 版）
-│   ├── review-sph.ps1        复盘入口
+│   ├── review-all-sph.ps1    一键批量复盘编排脚本
+│   ├── retro_analyze.py      复盘诊断、账号经验库与 HTML 看板生成器
+│   ├── review-sph.ps1        单条复盘入口
 │   ├── check-pending-retros.ps1  待复盘提醒（SessionStart hook）
 │   ├── oneclick_asr.py       本地转写（FunASR）
 │   ├── transcribe*.py        本地转写（faster-whisper / FunASR）
 │   └── ego/                  浏览器自动化脚本
-│       ├── publish-sph-ego.mjs   上传 + 发表
+│       ├── ensure-login.mjs      共享登录门禁与窗口拉起
+│       ├── publish-sph-ego.mjs   上传 + 发表 + 首屏同步
 │       ├── login-gate.mjs        登录态检测
-│       └── collect-sph-post.mjs  复盘数据采集
+│       ├── collect-sph-post.mjs  单条复盘数据采集
+│       └── collect-sph-batch.mjs 批量复盘数据采集
 └── .claude/settings.json     SessionStart 自动提醒配置
 ```
 

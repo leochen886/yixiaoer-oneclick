@@ -8,11 +8,33 @@ export function shortTitle(title) {
   return Array.from((title || "").replace(/[,，\s]+/gu, " ").trim()).slice(0, 16).join("").trimEnd();
 }
 
+// Runs in the page. A laid-out Wujie field may still be outside its scroll container.
+function inspectShortTitle({ selector, reveal = false }) {
+  const roots = [document, ...Array.from(document.querySelectorAll("wujie-app"), host => host.shadowRoot).filter(Boolean)];
+  const inputs = roots.flatMap(root => Array.from(root.querySelectorAll(selector))).filter(input => {
+    const rect = input.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && getComputedStyle(input).visibility === "visible";
+  });
+  if (inputs.length !== 1) throw new Error("无法唯一定位短标题输入框，找到 " + inputs.length + " 个");
+  const [input] = inputs;
+  if (reveal) input.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+  return input.value;
+}
+
 export async function fillShortTitle(page, inputTitle) {
   const title = shortTitle(inputTitle);
   if (title) {
     await page.waitForSelector(TITLE_INPUT, { state: "visible", timeout: 900000 });
-    await page.fill(TITLE_INPUT, title);
+    try {
+      await page.fill(TITLE_INPUT, title);
+    } catch (error) {
+      if (!/not visible in the viewport/i.test(error.message)) throw error;
+      const value = await page.evaluate(inspectShortTitle, { selector: TITLE_INPUT, reveal: true });
+      if (value !== title) await page.fill(TITLE_INPUT, title, { timeout: 8000 });
+    }
+    if (await page.evaluate(inspectShortTitle, { selector: TITLE_INPUT }) !== title) {
+      throw new Error("短标题回读与预期不符，请核对编辑页");
+    }
   }
   console.log("FORM_TITLE=" + title);
   return title;

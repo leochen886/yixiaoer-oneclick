@@ -1,0 +1,736 @@
+<title>Claude Code 命令手册</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* Layout: sticky header + search, left TOC rail on desktop, command rows grouped into sections */
+  :root{
+    --bg:#faf8f5; --surface:#ffffff; --surface-2:#f4f1eb;
+    --fg:#1d1b18; --fg-muted:#6a655e; --fg-faint:#97908a;
+    --border:#e7e2d9; --border-strong:#d6d0c5;
+    --accent:#c04f22; --accent-fg:#ffffff; --accent-soft:#f6e4da;
+    --warn:#b23a2a; --warn-soft:#f8e4e0;
+    --safe:#2f7d4e; --safe-soft:#e1efe6;
+    --mono-bg:#f1eee8; --mono-fg:#3a332c;
+    --font-sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+    --font-mono:"IBM Plex Mono",ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace;
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#151311; --surface:#1d1a17; --surface-2:#26221c;
+      --fg:#ebe6de; --fg-muted:#aaa39a; --fg-faint:#7c746c;
+      --border:#322d27; --border-strong:#453e36;
+      --accent:#e0794a; --accent-fg:#1d1a17; --accent-soft:#31251d;
+      --warn:#e27a6b; --warn-soft:#33211d;
+      --safe:#82bf97; --safe-soft:#1e2b22;
+      --mono-bg:#221f1b; --mono-fg:#e6c9b2;
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#151311; --surface:#1d1a17; --surface-2:#26221c;
+    --fg:#ebe6de; --fg-muted:#aaa39a; --fg-faint:#7c746c;
+    --border:#322d27; --border-strong:#453e36;
+    --accent:#e0794a; --accent-fg:#1d1a17; --accent-soft:#31251d;
+    --warn:#e27a6b; --warn-soft:#33211d;
+    --safe:#82bf97; --safe-soft:#1e2b22;
+    --mono-bg:#221f1b; --mono-fg:#e6c9b2;
+    color-scheme:dark;
+  }
+
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; }
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:var(--font-sans); font-size:15.5px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  body::before{ content:""; position:fixed; inset:0 0 auto; height:env(safe-area-inset-top,0px); z-index:10; background:var(--surface); }
+
+  .shell{
+    width:100%; max-width:1180px; margin:0 auto;
+    padding-left:max(16px,env(safe-area-inset-left,0px));
+    padding-right:max(16px,env(safe-area-inset-right,0px));
+  }
+
+  /* Header */
+  .header{
+    position:sticky; top:env(safe-area-inset-top,0px); z-index:5;
+    background:var(--surface); border-bottom:1px solid var(--border);
+  }
+  .header__inner{ padding-block:16px 14px; }
+  .header__top{ display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .eyebrow{
+    font-family:var(--font-mono); font-size:12px; letter-spacing:.14em;
+    color:var(--accent); text-transform:uppercase; font-weight:500;
+  }
+  .title{
+    font-size:22px; font-weight:700; letter-spacing:-.01em; margin:2px 0 0;
+    text-wrap:balance;
+  }
+  .subtitle{ color:var(--fg-muted); font-size:13.5px; margin:4px 0 0; }
+  .searchbar{ display:flex; align-items:center; gap:10px; margin-top:14px; }
+  .search{
+    flex:1; min-width:0;
+    display:flex; align-items:center; gap:10px;
+    background:var(--surface-2); border:1px solid var(--border);
+    border-radius:var(--radius); padding:10px 12px;
+  }
+  .search:focus-within{ border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .search svg{ flex:none; color:var(--fg-faint); }
+  .search input{
+    flex:1; min-width:0; border:0; outline:0; background:transparent;
+    color:var(--fg); font:inherit; font-size:14.5px;
+  }
+  .search input::placeholder{ color:var(--fg-faint); }
+  .kbd{
+    font-family:var(--font-mono); font-size:11.5px; color:var(--fg-muted);
+    border:1px solid var(--border-strong); border-radius:5px; padding:1px 6px;
+    flex:none;
+  }
+  .count{
+    flex:none; font-family:var(--font-mono); font-size:13px; color:var(--fg-muted);
+    background:var(--surface-2); border:1px solid var(--border);
+    border-radius:999px; padding:6px 12px; font-variant-numeric:tabular-nums;
+  }
+
+  /* Layout */
+  .layout{ display:grid; grid-template-columns:212px minmax(0,1fr); gap:40px; padding-block:28px 72px; }
+
+  .toc{ position:sticky; top:calc(env(safe-area-inset-top,0px) + 118px); align-self:start; max-height:calc(100vh - 150px); overflow:auto; padding-bottom:24px; }
+  .toc__label{ font-family:var(--font-mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--fg-faint); margin:0 0 10px; }
+  .toc a{
+    display:block; color:var(--fg-muted); text-decoration:none; font-size:13.5px;
+    padding:5px 10px; border-left:2px solid var(--border); border-radius:0 6px 6px 0;
+    margin-bottom:2px;
+  }
+  .toc a:hover{ color:var(--fg); background:var(--surface-2); }
+  .toc a.active{ color:var(--accent); border-left-color:var(--accent); background:var(--accent-soft); }
+
+  main{ min-width:0; }
+
+  section{ margin-bottom:44px; }
+  section[hidden]{ display:none; }
+  .sec-head{ margin-bottom:18px; }
+  .sec-head h2{
+    font-size:17px; font-weight:700; margin:6px 0 2px; letter-spacing:-.01em;
+    display:flex; align-items:center; gap:10px;
+  }
+  .sec-head .n{
+    font-family:var(--font-mono); font-size:12px; color:var(--fg-faint);
+    font-weight:400; flex:none;
+  }
+  .sec-head .sec-sub{ color:var(--fg-muted); font-size:13px; margin:0; }
+
+  .cmd{
+    border:1px solid var(--border); border-radius:var(--radius);
+    background:var(--surface); padding:13px 15px; margin-bottom:10px;
+  }
+  .cmd[hidden]{ display:none; }
+  .cmd__head{ display:flex; align-items:flex-start; gap:10px; flex-wrap:wrap; }
+  .cmd__name{
+    font-family:var(--font-mono); font-size:14px; font-weight:500;
+    color:var(--accent); word-break:break-word;
+  }
+  .cmd__desc{ margin:7px 0 0; color:var(--fg); font-size:14px; }
+  .cmd__ex{
+    display:inline-block; margin-top:9px;
+    font-family:var(--font-mono); font-size:12.5px; line-height:1.55;
+    color:var(--mono-fg); background:var(--mono-bg);
+    border-radius:6px; padding:4px 8px; word-break:break-word; max-width:100%;
+  }
+  .tag{
+    flex:none; font-size:11.5px; font-weight:600; letter-spacing:.02em;
+    border-radius:999px; padding:1px 8px; line-height:1.6;
+  }
+  .tag[data-kind="warn"]{ color:var(--warn); background:var(--warn-soft); }
+  .tag[data-kind="safe"]{ color:var(--safe); background:var(--safe-soft); }
+
+  .empty{
+    display:flex; flex-direction:column; align-items:center; gap:6px;
+    text-align:center; padding:56px 20px; color:var(--fg-muted);
+  }
+  .empty .big{ font-size:15px; font-weight:600; color:var(--fg); }
+  .empty[hidden]{ display:none; }
+
+  @media (max-width:900px){
+    .layout{ grid-template-columns:1fr; gap:0; }
+    .toc{ display:none; }
+    .title{ font-size:20px; }
+    .kbd{ display:none; }
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{ scroll-behavior:auto !important; }
+  }
+</style>
+
+<header class="header">
+  <div class="shell header__inner">
+    <div class="header__top">
+      <span class="eyebrow">Claude Code · 参考手册</span>
+    </div>
+    <h1 class="title">Claude Code 命令手册</h1>
+    <p class="subtitle">`claude` CLI 的全部启动选项与子命令，中文说明 + 示例，支持实时搜索。</p>
+    <div class="searchbar">
+      <div class="search">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+        <input id="search" type="text" placeholder="搜索命令、参数或说明…" autocomplete="off" spellcheck="false">
+        <span class="kbd">/</span>
+      </div>
+      <span class="count" id="count"></span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="shell">
+    <div class="layout">
+
+      <nav class="toc" id="toc">
+        <p class="toc__label">目录</p>
+        <a href="#qs">快速上手</a>
+        <a href="#session">会话与恢复</a>
+        <a href="#model">模型与推理</a>
+        <a href="#perm">权限与工具控制</a>
+        <a href="#safety">安全 / 隔离模式</a>
+        <a href="#io">输入 / 输出</a>
+        <a href="#ctx">系统提示 / 上下文</a>
+        <a href="#config">配置与扩展</a>
+        <a href="#bg">后台 / 远程 / 隔离工作区</a>
+        <a href="#ui">界面 / 集成</a>
+        <a href="#cmds">子命令</a>
+      </nav>
+
+      <div>
+
+        <section id="qs">
+          <div class="sec-head">
+            <h2><span class="n">01</span>快速上手</h2>
+            <p class="sec-sub">最常用的几种启动方式。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude</code></div>
+            <p class="cmd__desc">直接进入交互式会话（默认模式）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude "提示"</code></div>
+            <p class="cmd__desc">带上问题直接启动会话。</p>
+            <code class="cmd__ex">claude "帮我写个脚本"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude -p "提示"</code></div>
+            <p class="cmd__desc">非交互模式：一次性问答，打印结果后退出，适合管道和脚本调用。</p>
+            <code class="cmd__ex">claude -p "总结 README" | less</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude -c</code></div>
+            <p class="cmd__desc">继续当前目录最近一次对话。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude -v / --version</code></div>
+            <p class="cmd__desc">查看版本号。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">claude --help</code></div>
+            <p class="cmd__desc">查看本手册对应的原始帮助。</p>
+          </article>
+        </section>
+
+        <section id="session">
+          <div class="sec-head">
+            <h2><span class="n">02</span>会话与恢复</h2>
+            <p class="sec-sub">继续、恢复、命名和持久化会话。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-c, --continue</code></div>
+            <p class="cmd__desc">继续当前目录最近一次对话。</p>
+            <code class="cmd__ex">claude -c</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-r, --resume [值]</code></div>
+            <p class="cmd__desc">按会话 ID 或名称恢复对话；不填则打开选择器。</p>
+            <code class="cmd__ex">claude -r</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--fork-session</code></div>
+            <p class="cmd__desc">恢复时新建会话 ID（不覆盖原会话），配合 --resume / --continue。</p>
+            <code class="cmd__ex">claude -r abc --fork-session</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--from-pr [值]</code></div>
+            <p class="cmd__desc">恢复某个 PR 关联的会话（按 PR 号 / 链接，或打开选择器）。</p>
+            <code class="cmd__ex">claude --from-pr 123</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--teleport [会话]</code></div>
+            <p class="cmd__desc">恢复一个 teleport 会话。</p>
+            <code class="cmd__ex">claude --teleport</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-n, --name &lt;名称&gt;</code></div>
+            <p class="cmd__desc">给会话设显示名（显示在提示框、/resume 选择器和终端标题）。</p>
+            <code class="cmd__ex">claude -n "改登录 bug"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--session-id &lt;uuid&gt;</code></div>
+            <p class="cmd__desc">指定一个固定的会话 UUID。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--cloud [描述|id|url]</code></div>
+            <p class="cmd__desc">创建云端会话（填描述），或按 ID / claude.ai/code 链接附加已有会话。</p>
+            <code class="cmd__ex">claude --cloud "代码审查"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--no-session-persistence</code></div>
+            <p class="cmd__desc">不保存会话到磁盘、不可恢复（仅 -p 模式）。</p>
+          </article>
+        </section>
+
+        <section id="model">
+          <div class="sec-head">
+            <h2><span class="n">03</span>模型与推理</h2>
+            <p class="sec-sub">选择模型、努力度、回退与预算。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--model &lt;模型&gt;</code></div>
+            <p class="cmd__desc">指定本次会话的模型（可用别名 fable / opus / sonnet，或完整模型名）。</p>
+            <code class="cmd__ex">claude --model sonnet</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--fallback-model &lt;模型&gt;</code></div>
+            <p class="cmd__desc">主模型过载 / 不可用时自动回退，可传逗号分隔的多个依次尝试。</p>
+            <code class="cmd__ex">claude --fallback-model haiku</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--effort &lt;级别&gt;</code></div>
+            <p class="cmd__desc">推理努力级别：low / medium / high / xhigh / max。</p>
+            <code class="cmd__ex">claude --effort high</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--betas &lt;头...&gt;</code></div>
+            <p class="cmd__desc">向 API 请求附加 beta 头（仅 API key 用户）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--max-budget-usd &lt;金额&gt;</code></div>
+            <p class="cmd__desc">本次 API 花费上限（美元，仅 -p 模式）。</p>
+            <code class="cmd__ex">claude -p --max-budget-usd 5 "..."</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--autocompact &lt;auto|tokens&gt;</code></div>
+            <p class="cmd__desc">自动压缩窗口大小（auto，或 100k–1M 的具体 token 数）。</p>
+            <code class="cmd__ex">claude --autocompact 200k</code>
+          </article>
+        </section>
+
+        <section id="perm">
+          <div class="sec-head">
+            <h2><span class="n">04</span>权限与工具控制</h2>
+            <p class="sec-sub">控制能做什么、允许 / 禁止哪些工具。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--permission-mode &lt;模式&gt;</code></div>
+            <p class="cmd__desc">权限模式：acceptEdits / auto / bypassPermissions / manual / dontAsk / plan。</p>
+            <code class="cmd__ex">claude --permission-mode plan</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--allowedTools, --allowed-tools &lt;工具...&gt;</code></div>
+            <p class="cmd__desc">允许的工具列表（逗号或空格分隔）。</p>
+            <code class="cmd__ex">claude --allowedTools "Bash(git *)" Edit</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--disallowedTools, --disallowed-tools &lt;工具...&gt;</code></div>
+            <p class="cmd__desc">禁止的工具列表。</p>
+            <code class="cmd__ex">claude --disallowedTools "Bash(rm *)"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--tools &lt;工具...&gt;</code></div>
+            <p class="cmd__desc">指定可用内置工具集；"" 禁用全部，"default" 用默认集。</p>
+            <code class="cmd__ex">claude --tools "Bash,Edit,Read"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--dangerously-skip-permissions</code><span class="tag" data-kind="warn">危险</span></div>
+            <p class="cmd__desc">直接跳过所有权限检查。仅建议无网沙箱使用。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--allow-dangerously-skip-permissions</code><span class="tag" data-kind="warn">危险</span></div>
+            <p class="cmd__desc">把「跳过权限」做成一个可选开关（默认不启用）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--permission-prompts &lt;目标&gt;</code></div>
+            <p class="cmd__desc">-p 模式下谁回答权限提示：host（SDK 宿主）或 none（一律自动拒绝）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--disable-slash-commands</code></div>
+            <p class="cmd__desc">禁用所有技能和斜杠命令。</p>
+          </article>
+        </section>
+
+        <section id="safety">
+          <div class="sec-head">
+            <h2><span class="n">05</span>安全 / 隔离模式</h2>
+            <p class="sec-sub">排查问题或限制权限时用的保护模式。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--restricted</code><span class="tag" data-kind="safe">防护</span></div>
+            <p class="cmd__desc">受限模式：移除 Bash / PowerShell 等执行命令的工具和 WebFetch（除非 --tools 指名）；忽略用户 / 项目 / 本地设置；文件工具限制在工作目录内。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--safe-mode</code><span class="tag" data-kind="safe">防护</span></div>
+            <p class="cmd__desc">安全模式：禁用所有自定义（CLAUDE.md、技能、插件、hooks、MCP、自定义命令等），用于排查坏掉的配置。</p>
+            <code class="cmd__ex">claude --safe-mode</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--bare</code><span class="tag" data-kind="safe">防护</span></div>
+            <p class="cmd__desc">极简模式：跳过 hooks、LSP、插件同步、自动记忆、CLAUDE.md 自动发现等；认证只认 ANTHROPIC_API_KEY 或 apiKeyHelper。</p>
+          </article>
+        </section>
+
+        <section id="io">
+          <div class="sec-head">
+            <h2><span class="n">06</span>输入 / 输出</h2>
+            <p class="sec-sub">控制输出格式、调试与流式传输。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-p, --print</code></div>
+            <p class="cmd__desc">非交互：打印响应后退出（适合管道）。注意：非交互下会跳过工作区信任对话框。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--output-format &lt;格式&gt;</code></div>
+            <p class="cmd__desc">输出格式：text（默认）/ json（单结果）/ stream-json（实时流）。</p>
+            <code class="cmd__ex">claude -p --output-format json "..."</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--input-format &lt;格式&gt;</code></div>
+            <p class="cmd__desc">输入格式（仅 -p）：text（默认）/ stream-json。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--json-schema &lt;schema&gt;</code></div>
+            <p class="cmd__desc">结构化输出的 JSON Schema 校验（仅 -p）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--verbose</code></div>
+            <p class="cmd__desc">覆盖配置，开启详细输出。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-d, --debug [过滤]</code></div>
+            <p class="cmd__desc">调试模式，可按类别过滤（如 hooks,mcp；! 表示排除）。</p>
+            <code class="cmd__ex">claude --debug=hooks,mcp</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--debug-file &lt;路径&gt;</code></div>
+            <p class="cmd__desc">调试日志写到指定文件（隐含开启调试）。</p>
+            <code class="cmd__ex">claude --debug-file ./debug.log</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--include-hook-events</code></div>
+            <p class="cmd__desc">输出流中包含所有 hook 生命周期事件（仅 stream-json）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--include-partial-messages</code></div>
+            <p class="cmd__desc">输出流中包含部分消息块（仅 -p + stream-json）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--replay-user-messages</code></div>
+            <p class="cmd__desc">把 stdin 收到的用户消息回写到 stdout 确认（仅 stream-json 双向）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--forward-subagent-text</code></div>
+            <p class="cmd__desc">转发子代理文本和思考块（仅 -p + stream-json）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--prompt-suggestions [值]</code></div>
+            <p class="cmd__desc">是否开启下一句提示建议（print / SDK 模式下每轮发一个建议）。</p>
+          </article>
+        </section>
+
+        <section id="ctx">
+          <div class="sec-head">
+            <h2><span class="n">07</span>系统提示 / 上下文</h2>
+            <p class="sec-sub">定制系统提示、附加上下文与文件资源。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--system-prompt &lt;提示&gt;</code></div>
+            <p class="cmd__desc">用自定义系统提示替换默认提示。</p>
+            <code class="cmd__ex">claude --system-prompt "你是…"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--append-system-prompt &lt;提示&gt;</code></div>
+            <p class="cmd__desc">在默认系统提示后追加内容。</p>
+            <code class="cmd__ex">claude --append-system-prompt "用中文回答"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--system-prompt-snapshot &lt;on|off&gt;</code></div>
+            <p class="cmd__desc">系统提示是否每会话记录一次并逐次复用（on 默认；off 每次都重新渲染）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--exclude-dynamic-system-prompt-sections</code></div>
+            <p class="cmd__desc">把每台机器不同的段（cwd、env、内存路径、git 状态）移到首条用户消息，利于跨用户缓存复用。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--add-dir &lt;目录...&gt;</code></div>
+            <p class="cmd__desc">额外允许工具访问的目录。</p>
+            <code class="cmd__ex">claude --add-dir "D:\代码" "D:\文档"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--file &lt;规格...&gt;</code></div>
+            <p class="cmd__desc">启动时下载文件资源，格式 file_id:相对路径。</p>
+            <code class="cmd__ex">claude --file file_abc:doc.txt</code>
+          </article>
+        </section>
+
+        <section id="config">
+          <div class="sec-head">
+            <h2><span class="n">08</span>配置与扩展</h2>
+            <p class="sec-sub">加载设置、代理、MCP 服务器与插件。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--settings &lt;文件或JSON&gt;</code></div>
+            <p class="cmd__desc">加载额外设置（JSON 文件路径或 JSON 字符串）。</p>
+            <code class="cmd__ex">claude --settings ./my-settings.json</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--setting-sources &lt;源&gt;</code></div>
+            <p class="cmd__desc">加载哪些设置源：user / project / local（逗号分隔）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--agents &lt;JSON或文件&gt;</code></div>
+            <p class="cmd__desc">定义自定义代理（JSON 或文件路径）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--agent &lt;代理&gt;</code></div>
+            <p class="cmd__desc">指定本次会话的代理（覆盖 agent 设置）。</p>
+            <code class="cmd__ex">claude --agent reviewer</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--mcp-config &lt;配置...&gt;</code></div>
+            <p class="cmd__desc">从 JSON 文件或字符串加载 MCP 服务器（空格分隔）。</p>
+            <code class="cmd__ex">claude --mcp-config ./mcp.json</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--strict-mcp-config</code></div>
+            <p class="cmd__desc">只用 --mcp-config 指定的 MCP，忽略其它所有 MCP 配置。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--plugin-dir &lt;路径&gt;</code></div>
+            <p class="cmd__desc">从目录或 .zip 加载插件（仅本次会话，可重复）。</p>
+            <code class="cmd__ex">claude --plugin-dir ./my-plugin</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--plugin-url &lt;url&gt;</code></div>
+            <p class="cmd__desc">从 URL 拉取插件 .zip（仅本次会话，可重复）。</p>
+          </article>
+        </section>
+
+        <section id="bg">
+          <div class="sec-head">
+            <h2><span class="n">09</span>后台 / 远程 / 隔离工作区</h2>
+            <p class="sec-sub">后台运行、远程控制与独立 git worktree。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--bg, --background</code></div>
+            <p class="cmd__desc">后台启动会话并立即返回，打印 id（供 attach / logs / stop / rm 用）。</p>
+            <code class="cmd__ex">claude --bg "跑个长任务"</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--remote-control [名称]</code></div>
+            <p class="cmd__desc">启动带远程控制的交互会话（可命名）。</p>
+            <code class="cmd__ex">claude --remote-control my-session</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--remote-control-session-name-prefix &lt;前缀&gt;</code></div>
+            <p class="cmd__desc">自动生成远程会话名的前缀（默认主机名）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">-w, --worktree [名称]</code></div>
+            <p class="cmd__desc">为本次会话新建 git worktree（可命名）。</p>
+            <code class="cmd__ex">claude -w</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--tmux</code></div>
+            <p class="cmd__desc">为 worktree 建 tmux 会话（需 --worktree；--tmux=classic 用传统 tmux）。</p>
+            <code class="cmd__ex">claude -w --tmux</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--environment &lt;id&gt;</code></div>
+            <p class="cmd__desc">在指定自托管环境上创建云端会话（ccpool_...）。</p>
+          </article>
+        </section>
+
+        <section id="ui">
+          <div class="sec-head">
+            <h2><span class="n">10</span>界面 / 集成</h2>
+            <p class="sec-sub">桌面 App、IDE、Chrome 与无障碍输出。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--desktop</code></div>
+            <p class="cmd__desc">在 Claude 桌面 App 打开（配合 --continue / --resume 选会话）。</p>
+            <code class="cmd__ex">claude --desktop -c</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--ide</code></div>
+            <p class="cmd__desc">启动时自动连接 IDE（仅当恰好一个有效 IDE 时）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--chrome / --no-chrome</code></div>
+            <p class="cmd__desc">开启 / 关闭 Claude in Chrome 集成。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--brief</code></div>
+            <p class="cmd__desc">启用 SendUserMessage 工具（代理与用户通信）。</p>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">--ax-screen-reader</code></div>
+            <p class="cmd__desc">屏幕阅读器友好输出（纯文本、无边框动画）。</p>
+          </article>
+        </section>
+
+        <section id="cmds">
+          <div class="sec-head">
+            <h2><span class="n">11</span>子命令</h2>
+            <p class="sec-sub">claude 的子命令（命令 = claude &lt;子命令&gt;）。</p>
+          </div>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">agents</code></div>
+            <p class="cmd__desc">管理后台代理。</p>
+            <code class="cmd__ex">claude agents</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">attach &lt;id|名称&gt;</code></div>
+            <p class="cmd__desc">在终端打开一个后台会话。</p>
+            <code class="cmd__ex">claude attach abc123</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">auth</code></div>
+            <p class="cmd__desc">管理认证（登录 / 切换 / 退出）。</p>
+            <code class="cmd__ex">claude auth</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">auto-mode</code></div>
+            <p class="cmd__desc">检查或重置 auto 模式配置。</p>
+            <code class="cmd__ex">claude auto-mode</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">doctor</code></div>
+            <p class="cmd__desc">检查 Claude Code 安装健康（只读）。</p>
+            <code class="cmd__ex">claude doctor</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">gateway</code></div>
+            <p class="cmd__desc">运行企业认证 / 遥测网关。</p>
+            <code class="cmd__ex">claude gateway</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">import [来源]</code></div>
+            <p class="cmd__desc">从其它 AI 编码工具导入配置。</p>
+            <code class="cmd__ex">claude import cursor</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">install [版本]</code></div>
+            <p class="cmd__desc">安装原生构建（stable / latest / 具体版本）。</p>
+            <code class="cmd__ex">claude install</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">logs &lt;id|名称&gt;</code></div>
+            <p class="cmd__desc">打印后台会话最近的终端输出。</p>
+            <code class="cmd__ex">claude logs abc123</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">mcp</code></div>
+            <p class="cmd__desc">配置和管理 MCP 服务器。</p>
+            <code class="cmd__ex">claude mcp list</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">plugin / plugins</code></div>
+            <p class="cmd__desc">管理 Claude Code 插件。</p>
+            <code class="cmd__ex">claude plugin list</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">purge [路径]</code></div>
+            <p class="cmd__desc">删除某项目在本机的数据（记录、任务、文件历史等）。</p>
+            <code class="cmd__ex">claude purge ./项目</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">respawn [id]</code></div>
+            <p class="cmd__desc">重启后台会话（--all 重启全部），使其跑当前版本。</p>
+            <code class="cmd__ex">claude respawn --all</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">rm &lt;id&gt;</code></div>
+            <p class="cmd__desc">删除后台会话（及安全的 worktree）。</p>
+            <code class="cmd__ex">claude rm abc123</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">setup-token</code></div>
+            <p class="cmd__desc">设置长期认证 token（需订阅）。</p>
+            <code class="cmd__ex">claude setup-token</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">stop / kill &lt;id&gt;</code></div>
+            <p class="cmd__desc">停止后台会话（对话保留，可 attach / --resume 恢复）。</p>
+            <code class="cmd__ex">claude stop abc123</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">ultrareview [目标]</code></div>
+            <p class="cmd__desc">云托管多代理代码审查当前分支（或 PR 号 / 基础分支）。</p>
+            <code class="cmd__ex">claude ultrareview</code>
+          </article>
+          <article class="cmd">
+            <div class="cmd__head"><code class="cmd__name">update / upgrade</code></div>
+            <p class="cmd__desc">检查并安装更新（包管理器安装的走包管理器）。</p>
+            <code class="cmd__ex">claude update</code>
+          </article>
+        </section>
+
+        <div class="empty" id="empty" hidden>
+          <span class="big">没有匹配的命令</span>
+          <span>换个关键词试试，或清空搜索。</span>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+(function(){
+  var input = document.getElementById('search');
+  var count = document.getElementById('count');
+  var empty = document.getElementById('empty');
+  var cmds = Array.prototype.slice.call(document.querySelectorAll('.cmd'));
+  var sections = Array.prototype.slice.call(document.querySelectorAll('section'));
+  var total = cmds.length;
+  count.textContent = total + ' 条';
+
+  function apply(){
+    var q = input.value.trim().toLowerCase();
+    var shown = 0;
+    cmds.forEach(function(c){
+      var hit = !q || c.textContent.toLowerCase().indexOf(q) !== -1;
+      c.hidden = !hit;
+      if (hit) shown++;
+    });
+    sections.forEach(function(s){
+      var any = s.querySelector('.cmd:not([hidden])');
+      s.hidden = !any;
+    });
+    empty.hidden = shown > 0;
+    count.textContent = q ? shown + ' / ' + total : total + ' 条';
+  }
+
+  input.addEventListener('input', apply);
+
+  document.addEventListener('keydown', function(e){
+    if (e.key === '/' && document.activeElement !== input && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)){
+      e.preventDefault();
+      input.focus();
+    }
+    if (e.key === 'Escape' && document.activeElement === input){
+      input.value = '';
+      apply();
+      input.blur();
+    }
+  });
+})();
+</script>

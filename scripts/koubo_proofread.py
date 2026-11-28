@@ -58,11 +58,33 @@ def transcribe_deepseek(wav, quiet):
             with wave.open(pcm, "wb") as part:
                 part.setparams(audio.getparams())
                 part.writeframes(audio.readframes(end-start))
-            response = requests.post("https://api.deepseek.com/v1/tools/asr",
-                files={"file": ("speech.wav", pcm.getvalue(), "audio/wav")},
-                headers={"Authorization": "Bearer " + key}, timeout=(15, 180), allow_redirects=False)
-            if response.status_code != 200:
-                raise RuntimeError(f"DeepSeek 原声音轨识别失败（HTTP {response.status_code}）。")
+            pcm_bytes = pcm.getvalue()
+            response = None
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    response = requests.post(
+                        "https://api.deepseek.com/v1/tools/asr",
+                        files={"file": ("speech.wav", pcm_bytes, "audio/wav")},
+                        headers={"Authorization": "Bearer " + key},
+                        timeout=(15, 180),
+                        allow_redirects=False,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    last_exc = exc
+                    response = None
+                else:
+                    if response.status_code == 200:
+                        break
+                    if response.status_code != 429 and response.status_code < 500:
+                        raise RuntimeError(f"DeepSeek 原声音轨识别失败（HTTP {response.status_code}）。")
+                    last_exc = RuntimeError(f"DeepSeek 原声音轨识别失败（HTTP {response.status_code}）。")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+            else:
+                if isinstance(last_exc, RuntimeError):
+                    raise last_exc
+                raise RuntimeError(f"DeepSeek 原声音轨识别失败（{type(last_exc).__name__}: {last_exc}）。") from last_exc
             data = response.json()
             if not isinstance(data.get("text"), str) or not data.get("request_id"):
                 raise ValueError("DeepSeek 没有返回可核实的原声听写记录。")

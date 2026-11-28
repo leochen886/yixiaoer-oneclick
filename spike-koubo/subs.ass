@@ -1,0 +1,44 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Microsoft YaHei,100,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,1,2,0,0,165,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+
+Dialogue: 0,0:00:00.12,0:00:00.88,Default,,0,0,0,,就这哥们儿
+Dialogue: 0,0:00:01.12,0:00:03.56,Default,,0,0,0,,就这哥们儿大家肯定都不陌生了
+Dialogue: 0,0:00:03.80,0:00:05.48,Default,,0,0,0,,这一看就不是好人了
+Dialogue: 0,0:00:05.72,0:00:06.38,Default,,0,0,0,,我靠
+Dialogue: 0,0:00:06.38,0:00:08.46,Default,,0,0,0,,这哥们如果做到正常的位置
+Dialogue: 0,0:00:08.46,0:00:10.32,Default,,0,0,0,,绝对是拎着我们猛锤的人
+Dialogue: 0,0:00:10.32,0:00:12.66,Default,,0,0,0,,极度繁华人边那哥们儿也是
+Dialogue: 0,0:00:12.66,0:00:14.10,Default,,0,0,0,,而且说实话
+Dialogue: 0,0:00:14.10,0:00:15.22,Default,,0,0,0,,现在真的是站这里
+Dialogue: 0,0:00:15.22,0:00:15.64,Default,,0,0,0,,没办法
+Dialogue: 0,0:00:15.64,0:00:17.84,Default,,0,0,0,,现在他妈人家有嚣张的嚣张的资
+Dialogue: 0,0:00:17.86,0:00:18.14,Default,,0,0,0,,本了
+Dialogue: 0,0:00:18.14,0:00:18.38,Default,,0,0,0,,我靠
+Dialogue: 0,0:00:18.38,0:00:20.70,Default,,0,0,0,,好多人想去想去干他的股票
+Dialogue: 0,0:00:20.70,0:00:21.42,Default,,0,0,0,,我不建议
+Dialogue: 0,0:00:21.60,0:00:24.28,Default,,0,0,0,,我我我我我不做投资建议
+Dialogue: 0,0:00:24.28,0:00:25.57,Default,,0,0,0,,但是我不会做事儿
+Dialogue: 0,0:00:25.81,0:00:26.55,Default,,0,0,0,,据我所知
+Dialogue: 0,0:00:26.83,0:00:29.43,Default,,0,0,0,,他的收入有百分之七百分之七
+Dialogue: 0,0:00:29.61,0:00:33.17,Default,,0,0,0,,听着通过封号得到的什么概念
+Dialogue: 0,0:00:33.41,0:00:38.09,Default,,0,0,0,,我的妈百分之几封号小一整合
+Dialogue: 0,0:00:38.15,0:00:39.90,Default,,0,0,0,,这是我真的我咱
+Dialogue: 0,0:00:39.96,0:00:41.38,Default,,0,0,0,,这真的大漂亮滚
+Dialogue: 0,0:00:41.38,0:00:42.70,Default,,0,0,0,,真的是让我长见识
+Dialogue: 0,0:00:42.94,0:00:43.29,Default,,0,0,0,,对不起
+Dialogue: 0,0:00:43.48,0:00:43.69,Default,,0,0,0,,是的
+Dialogue: 0,0:00:43.93,0:00:47.00,Default,,0,0,0,,我身边有朋友里面几万块钱都直
+Dialogue: 0,0:00:47.00,0:00:48.04,Default,,0,0,0,,接封好
+Dialogue: 0,0:00:48.22,0:00:49.10,Default,,0,0,0,,好家伙
+Dialogue: 0,0:00:49.34,0:00:49.95,Default,,0,0,0,,真行

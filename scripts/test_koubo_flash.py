@@ -5,6 +5,7 @@ import unittest
 import wave
 from pathlib import Path
 from unittest.mock import Mock, patch
+import requests
 
 from koubo import compact_word_clock
 from koubo_deepseek import ask_flash, compact_silences, index_inputs, pause_trims, select_cuts
@@ -165,3 +166,21 @@ class FlashLengthTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content_filter"):
             self.run_flash()
         self.post.assert_called_once()
+
+    @patch("koubo_deepseek.time.sleep")
+    def test_flash_retries_transient_network_errors_and_stops_on_auth_error(self, sleep):
+        ok = response("ok", "stop", json.dumps(decisions(pauses=[[1, .4, "停顿"]])))
+        self.post.side_effect = [requests.exceptions.ConnectionError("drop"), ok]
+        result = self.run_flash()
+        self.assertEqual(result["request_id"], "ok")
+        self.assertEqual(self.post.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        (self.folder / "flash.json").unlink()
+        bad_resp = Mock(status_code=401)
+        http_err = requests.exceptions.HTTPError("unauthorized", response=bad_resp)
+        bad_resp.raise_for_status.side_effect = http_err
+        self.post.side_effect = [bad_resp]
+        with self.assertRaises(requests.exceptions.HTTPError):
+            self.run_flash()
+        self.assertEqual(self.post.call_count, 3)

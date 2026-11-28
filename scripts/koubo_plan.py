@@ -22,29 +22,68 @@ class Word:
     sentence_start: bool = False
 
 
+# One-to-one display variants keep the offsets in the original string valid.
+_ASR_DISPLAY_FORMS = {
+    **dict(zip(range(0xff01, 0xff5f), range(0x21, 0x7f))),
+    **str.maketrans("‘’‐‑", "''--"),
+}
+
+
+def timestamp_spans(text, raw_text, count):
+    # Paraformer returns its timestamped units space-separated before punctuation.
+    # Locate those exact units in the display text so punctuation still marks clauses.
+    units = raw_text.split() if isinstance(raw_text, str) else []
+    if units:
+        if len(units) != count:
+            raise ValueError(f"原始转写有 {len(units)} 个词、{count} 个时间戳，无法可靠定位剪点。")
+        # Punctuation restoration can change typography or insert spaces within
+        # a token. Keep source offsets to recover the actual punctuation between words.
+        indices = [i for i, c in enumerate(text) if not c.isspace()]
+        display = "".join(text[i] for i in indices).translate(_ASR_DISPLAY_FORMS)
+        spans = []
+        pos = 0
+        for unit in units:
+            expected = unit.translate(_ASR_DISPLAY_FORMS).casefold()
+            while display[pos:pos + len(unit)].casefold() != expected:
+                if pos == len(display) or not unicodedata.category(display[pos]).startswith("P"):
+                    raise ValueError(f"转写文字与原始分词不符，第 {len(spans) + 1} 个时间戳应对应 {unit!r}。")
+                pos += 1
+            spans.append((indices[pos], indices[pos + len(unit) - 1] + 1))
+            pos += len(unit)
+        if any(not unicodedata.category(c).startswith("P") for c in display[pos:]):
+            raise ValueError("转写末尾仍有文字没有对应的时间戳。")
+        return spans
+
+    # Older results may contain only the display text and timestamps. Accept a
+    # whole-word or character tokenization only when its count matches exactly.
+    for pattern in (r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*|[^\s]", r"[A-Za-z0-9]+|[^\s]", r"[^\s]"):
+        spans = [m.span() for m in re.finditer(pattern, text)
+                 if not unicodedata.category(m[0][0]).startswith("P")]
+        if len(spans) == count:
+            return spans
+    raise ValueError(f"转写文字与时间戳数量不符（{count} 个时间戳），无法可靠定位剪点。")
+
+
 def read_words(items):
     words = []
     for item in items:
         text = item["text"]
         times = item.get("timestamp", [])
-        # FunASR usually gives a Chinese character or an English word one stamp.
-        for pattern in (r"[A-Za-z0-9]+|[^\s]", r"[^\s]"):
-            tokens = [m for m in re.finditer(pattern, text)
-                      if unicodedata.category(m[0][0])[0] != "P"]
-            if len(tokens) == len(times):
-                break
-        else:
-            raise ValueError("转写文字与时间戳数量不符，无法可靠定位剪点。")
+        spans = timestamp_spans(text, item.get("raw_text"), len(times))
         previous = 0
-        for token, (start, end) in zip(tokens, times):
-            gap = text[previous:token.start()]
+        for (left, right), (start, end) in zip(spans, times):
+            gap = text[previous:left]
             start, end = start / 1000, end / 1000
             if not (0 <= start < end and math.isfinite(end)) or (words and start < words[-1].end):
                 raise ValueError("转写时间戳重叠或无效，无法可靠定位剪点。")
-            words.append(Word(token[0], start, end, previous == 0 or any(
+            # A single recognizer unit always owns one original time interval.
+            token = text[left:right]
+            if item.get("raw_text"):
+                token = "".join(token.translate(_ASR_DISPLAY_FORMS).split())
+            words.append(Word(token, start, end, previous == 0 or any(
                 unicodedata.category(c).startswith("P") for c in gap), bool(gap and gap[-1].isspace()),
                 any(c in "。！？!?；;\n" for c in gap) or gap.rstrip().endswith(".")))
-            previous = token.end()
+            previous = right
     if not words:
         raise ValueError("没有识别到带时间戳的人声。")
     return words

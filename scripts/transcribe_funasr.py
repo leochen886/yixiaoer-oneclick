@@ -17,7 +17,7 @@ def transcribe(audio_path, *, offline=False):
                 raise RuntimeError(f"无法读取本地语音模型 {model_id}，请检查 ModelScope 缓存。") from exc
 
     model = AutoModel(**models, device="cpu", disable_update=True, disable_pbar=offline)
-    return model.generate(input=str(audio_path), batch_size_s=300, hotword="")
+    return model.generate(input=str(audio_path), batch_size_s=300, hotword="", return_raw_text=True)
 
 
 if __name__ == "__main__":

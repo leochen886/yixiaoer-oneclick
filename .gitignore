@@ -17,6 +17,7 @@ koubo/
 # 发布运行记录与历史产物
 output/
 publish-runs/
+history/
 publish-test/
 publish-20261022/
 sph-1028/
@@ -34,3 +35,7 @@ __pycache__/
 
 # ego 运行时输入文件（每次发布/复盘临时生成）
 scripts/ego/*-input.json
+
+# 麦田（自媒体工作台）：独立 git 仓库，作为子目录放进来，不纳入本仓库
+自媒体工作台/
+

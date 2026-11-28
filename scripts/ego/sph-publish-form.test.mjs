@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
-import { declareOriginal, publishFromForm, shortTitle } from "./sph-publish-form.mjs";
+import { declareOriginal, fillShortTitle, publishFromForm, shortTitle } from "./sph-publish-form.mjs";
 
 const create = "https://channels.weixin.qq.com/platform/post/create";
 const list = "https://channels.weixin.qq.com/platform/post/list";
@@ -94,6 +94,46 @@ test("短标题中英文逗号变成空格，保留支持的问号和书名号",
   assert.equal(shortTitle(" 今天出门，记得带伞 "), "今天出门 记得带伞");
   assert.equal(shortTitle("《AI》,  怎么用？"), "《AI》 怎么用？");
   assert.equal(shortTitle(""), "");
+});
+
+test("短标题在 Wujie 滚动区外时，滚动后重填并回读原文", async () => {
+  const title = "两天跌20% 还被新模型吊打";
+  const selector = 'input[placeholder="填写短标题有机会获得更多流量"]';
+  let inView = false;
+  let fills = 0;
+  const input = {
+    value: "",
+    getBoundingClientRect: () => ({ width: 200, height: 32 }),
+    scrollIntoView(options) { assert.equal(options.block, "center"); inView = true; },
+  };
+  const hiddenCopy = { getBoundingClientRect: () => ({ width: 0, height: 0 }) };
+  const root = { querySelectorAll: s => s === selector ? [hiddenCopy, input] : [] };
+  const document = { querySelectorAll: s => s === "wujie-app" ? [{ shadowRoot: root }] : [] };
+  const page = {
+    async waitForSelector(s) { assert.equal(s, selector); },
+    async fill(s, value) {
+      assert.equal(s, selector);
+      fills++;
+      if (!inView) throw new Error("page.fill failed: element is not visible in the viewport");
+      input.value = value;
+    },
+    async evaluate(fn, arg) {
+      return runInNewContext("(" + fn.toString() + ")(arg)", {
+        document, arg, getComputedStyle: () => ({ visibility: "visible" }),
+      });
+    },
+  };
+  assert.equal(await fillShortTitle(page, title), title);
+  assert.equal(fills, 2);
+  assert.equal(input.value, title);
+});
+
+test("短标题回读不符或浏览器控制权变化时停止", async () => {
+  const page = { async waitForSelector() {}, async fill() {}, async evaluate() { return ""; } };
+  await assert.rejects(fillShortTitle(page, "短标题"), /短标题回读/);
+  page.fill = async () => { throw new Error("USER_CONTROL"); };
+  page.evaluate = () => assert.fail("交还给用户后不应继续操作");
+  await assert.rejects(fillShortTitle(page, "短标题"), /USER_CONTROL/);
 });
 
 for (const reason of ["短标题含特殊字符", "按钮仍为灰色", "找不到按钮"]) {

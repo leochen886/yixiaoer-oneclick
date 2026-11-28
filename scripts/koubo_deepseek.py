@@ -7,10 +7,12 @@ import unicodedata
 import re
 import subprocess
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from fractions import Fraction
 from pathlib import Path
+import time
 
 import numpy as np
 import requests
@@ -46,6 +48,72 @@ def spoken(text):
 
 def joined(words):
     return "".join((" " if w.space else "") + w.text for w in words).strip()
+
+
+CHINESE_NUMBER_CHARS = set("零〇一二两三四五六七八九十百千万亿点分之负正约%％")
+
+
+def load_glossary(root=None):
+    base = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    terms, aliases = [], {}
+    glossary_path = base / "koubo-glossary.json"
+    if glossary_path.is_file():
+        try:
+            data = read(glossary_path)
+            if isinstance(data, dict):
+                terms.extend(str(t).strip() for t in data.get("terms", []) if str(t).strip())
+                for k, v in (data.get("aliases") or {}).items():
+                    if str(k).strip() and str(v).strip():
+                        aliases[str(k).strip()] = str(v).strip()
+        except (OSError, ValueError):
+            pass
+    for playbook_path in (
+        base / "history" / "playbook.json",
+        base / "publish-runs" / "account-playbook.json",
+    ):
+        if not playbook_path.is_file():
+            continue
+        try:
+            pb = read(playbook_path)
+            suggestions = pb.get("glossary_suggestions", []) if isinstance(pb, dict) else []
+            for item in suggestions:
+                if isinstance(item, dict):
+                    if item.get("status") == "rejected":
+                        continue
+                    right = str(item.get("right") or "").strip()
+                    wrong = str(item.get("wrong") or "").strip()
+                    if right:
+                        terms.append(right)
+                        if wrong:
+                            aliases.setdefault(wrong, right)
+                elif isinstance(item, str) and item.strip():
+                    terms.append(item.strip())
+            if suggestions:
+                break
+        except (OSError, ValueError):
+            pass
+    return {"terms": list(dict.fromkeys(terms)), "aliases": aliases}
+
+
+def canonical_glossary_terms(glossary=None):
+    g = glossary if glossary is not None else load_glossary()
+    canon = {t.casefold() for t in g.get("terms", []) if t}
+    canon.update(v.casefold() for v in g.get("aliases", {}).values() if v)
+    return canon
+
+
+def format_glossary_hint(glossary):
+    if not glossary:
+        return ""
+    terms = glossary.get("terms") or []
+    aliases = glossary.get("aliases") or {}
+    parts = []
+    if terms:
+        parts.append("常用专名规范写法（仅在语境明确指代时修正）：" + "、".join(terms[:30]))
+    if aliases:
+        pairs = [f"{k}→{v}" for k, v in list(aliases.items())[:25]]
+        parts.append("常见口播误识对照：" + "；".join(pairs))
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
 def index_inputs(receipt, anchors, meta, min_pause=.35):
@@ -119,7 +187,11 @@ def collect_scoped_decisions(request, payload, limits):
     return proposal
 
 
-def ask_flash(content, records, limits, hook_chars=HOOK_CHAR_LIMIT):
+def ask_flash(content, records, limits, hook_chars=HOOK_CHAR_LIMIT, *, glossary=None, playbook_prompt=None):
+    active_glossary = load_glossary() if glossary is None else glossary
+    extra_guidance = format_glossary_hint(active_glossary)
+    if playbook_prompt:
+        extra_guidance += "\n账号历史复盘经验（供起钩子标题时参考，切勿编造内容）：\n" + playbook_prompt.strip()
     hook_instruction = (
         "\n另返回三个字符串。先从会保留的口播选一个值得追问、后文确实会解释或展示的细节。"
         "hook_evidence 原样摘录后文能回答或推进这个问题的一小句，用于本地核对，不上屏。"
@@ -133,7 +205,7 @@ def ask_flash(content, records, limits, hook_chars=HOOK_CHAR_LIMIT):
         "本片必须依据本片原话重新拟题。")
     payload = {"model": MODEL, "thinking": {"type":"enabled"}, "reasoning_effort":"low",
                "max_tokens": 16000, "response_format":{"type":"json_object"},
-               "messages":[{"role":"system","content":PROMPT},
+               "messages":[{"role":"system","content":PROMPT + extra_guidance},
                            {"role":"user","content":json.dumps(content, ensure_ascii=False)}]}
     def digest_of(body):
         return hashlib.sha256(json.dumps(body, ensure_ascii=False).encode()).hexdigest()
@@ -162,9 +234,25 @@ def ask_flash(content, records, limits, hook_chars=HOOK_CHAR_LIMIT):
     attempts, usage = [], {}
 
     def request(body, scope):
-        response = requests.post(ENDPOINT, json=body, headers=headers, timeout=(15, 330),
-                                 allow_redirects=False)
-        response.raise_for_status()
+        response = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                response = requests.post(ENDPOINT, json=body, headers=headers, timeout=(15, 330),
+                                         allow_redirects=False)
+                response.raise_for_status()
+                break
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status is not None and status != 429 and status < 500:
+                    raise
+                last_exc = exc
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        else:
+            raise last_exc
         data = response.json()
         choice = data["choices"][0]
         reason = choice["finish_reason"]
@@ -215,9 +303,10 @@ def preserves_facts(before, after):
     return markers(before) == markers(after)
 
 
-def apply_corrections(sentences, suggestions, protected_names=()):
+def apply_corrections(sentences, suggestions, protected_names=(), glossary_terms=None):
     reviewed = [s for _,s in sentences]
     audit = []
+    canon = {t.casefold() for t in (glossary_terms if glossary_terms is not None else canonical_glossary_terms())}
     for row in suggestions:
         ok = False
         if isinstance(row, list) and len(row) == 4:
@@ -229,7 +318,14 @@ def apply_corrections(sentences, suggestions, protected_names=()):
                 before = latin_names(reviewed[n-1])
                 after = latin_names(updated)
                 same_facts = preserves_facts(orig, new)
-                if same_facts and not any(before.count(name) > after.count(name) for name in protected_names):
+                dropped_protected = [name for name in protected_names if before.count(name) > after.count(name)]
+                allow_glossary_upgrade = (
+                    bool(dropped_protected)
+                    and bool(latin_names(orig))
+                    and any(t in latin_names(new) for t in canon)
+                    and not any(name in canon for name in dropped_protected)
+                )
+                if same_facts and (not dropped_protected or allow_glossary_upgrade):
                     reviewed[n-1] = updated
                     ok = True
         audit.append({"proposal":row,"applied":ok})
@@ -279,6 +375,9 @@ def supplement_hearing(chunks, anchors, *, name_variants=None):
             seconds = sum(w.end-w.start for w in missing)
             substantial = len(missing) - (d-c) >= 4 and len(missing) >= 2*(d-c) and seconds >= 1.0
             if op == "replace":
+                local_compact = re.sub(r"\s+", "", joined(missing))
+                if re.search(r"\d", original) and local_compact and all(c in CHINESE_NUMBER_CHARS for c in local_compact):
+                    continue
                 # One English name can correspond to many Chinese syllables. Keep both
                 # readings available to the reviewer without replacing the primary name.
                 names = set(latin_names(original)) - set(latin_names(joined(missing)))
@@ -325,7 +424,12 @@ def clock_transcript(chunks, sentences, reviewed, anchors):
     """Map the cloud transcript onto independent acoustic anchors within each ASR chunk."""
     slots = [[] for _ in anchors]
     for k, chunk in enumerate(chunks):
-        ids = [i for i,w in enumerate(anchors) if chunk["start"] <= (w.start+w.end)/2 < chunk["end"]]
+        is_last = k == len(chunks) - 1
+        ids = [
+            i for i, w in enumerate(anchors)
+            if chunk["start"] <= (w.start + w.end) / 2
+            and ((w.start + w.end) / 2 < chunk["end"] or (is_last and (w.start + w.end) / 2 <= chunk["end"] + 0.05))
+        ]
         target = []
         for n, (chunk_id, _) in enumerate(sentences):
             if chunk_id != k:
@@ -572,17 +676,35 @@ def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35
         meta = {"source":source.name,"sha256":digest,"duration":duration,"fps":str(rate),
                 "quiet":quiet_ranges(wav)}
         save(records/"source.json",meta)
-    if not (records/"asr.json").is_file():
+    asr_path = records / "asr.json"
+    anchors_path = records / "anchors.json"
+    if send_audio and not asr_path.is_file() and not anchors_path.is_file():
+        from transcribe_funasr import transcribe
+        print("正在并行执行 DeepSeek 原声听写与本机字词定位…", flush=True)
+        def run_cloud():
+            res = transcribe_deepseek(wav, meta["quiet"])
+            save(asr_path, res)
+            return res
+        def run_local():
+            res = [asdict(w) for w in read_words(transcribe(wav, offline=True))]
+            save(anchors_path, res)
+            return res
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_cloud = pool.submit(run_cloud)
+            fut_local = pool.submit(run_local)
+            fut_cloud.result()
+            fut_local.result()
+    if not asr_path.is_file():
         if not send_audio:
             raise ValueError("首次云端识别需用 --send-audio 指定本条音轨。")
         print("正在使用 DeepSeek ASR 听写原片音轨…", flush=True)
-        save(records/"asr.json",transcribe_deepseek(wav,meta["quiet"]))
-    receipt = read(records/"asr.json")
-    if not (records/"anchors.json").is_file():
+        save(asr_path, transcribe_deepseek(wav, meta["quiet"]))
+    receipt = read(asr_path)
+    if not anchors_path.is_file():
         from transcribe_funasr import transcribe
         print(f"DeepSeek 听写完成（{len(receipt['chunks'])} 段），正在本机定位原声字词与停顿…", flush=True)
-        save(records/"anchors.json",[asdict(w) for w in read_words(transcribe(wav,offline=True))])
-    anchors = [Word(**w) for w in read(records/"anchors.json")]
+        save(anchors_path, [asdict(w) for w in read_words(transcribe(wav, offline=True))])
+    anchors = [Word(**w) for w in read(anchors_path)]
     name_variants = []
     chunks, repairs = supplement_hearing(receipt["chunks"], anchors, name_variants=name_variants)
     if repairs:
@@ -590,10 +712,19 @@ def build_cut_plan(source, records, duration, rate, *, send_audio, min_pause=.35
     sentences, gaps, content = index_inputs({**receipt, "chunks": chunks},anchors,meta,min_pause)
     print(f"正在使用 DeepSeek Flash 核对全文（{len(sentences)} 句），判断重说与气口…", flush=True)
     limits = {"corrections": len(sentences), "repeats": len(anchors), "pauses": len(gaps)}
-    flash = ask_flash(content, records, limits, hook_chars)
+    glossary = load_glossary()
+    playbook_prompt = ""
+    try:
+        from retro_analyze import load_playbook_prompt
+        playbook_prompt = load_playbook_prompt(Path(__file__).resolve().parents[1] / "publish-runs", mode="hook")
+    except Exception:
+        playbook_prompt = ""
+    flash = ask_flash(content, records, limits, hook_chars, glossary=glossary, playbook_prompt=playbook_prompt)
     proposal = flash["proposal"]
     protected_names = {name for item in name_variants for name in item["names"]}
-    reviewed, correction_audit = apply_corrections(sentences,proposal["corrections"],protected_names)
+    reviewed, correction_audit = apply_corrections(
+        sentences, proposal["corrections"], protected_names, glossary_terms=canonical_glossary_terms(glossary)
+    )
     timed, owners = clock_transcript(chunks,sentences,reviewed,anchors)
     cuts, audit = select_cuts(anchors,owners,gaps,proposal,meta,wav)
     proof = {"input_mode":"deepseek_audio_first","model":flash["model"],

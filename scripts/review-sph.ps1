@@ -25,7 +25,7 @@ $Root = Split-Path -Parent $ScriptDir
 $RunRoot = Join-Path $Root 'publish-runs'
 $EgoDir = Join-Path $ScriptDir 'ego'
 $CollectScriptPath = Join-Path $EgoDir 'collect-sph-post.mjs'
-$CollectScriptUrl = 'file:///' + ($CollectScriptPath -replace '\\', '/')
+$CollectScriptBaseUri = ([System.Uri]$CollectScriptPath).AbsoluteUri
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-JsonFile {
@@ -34,13 +34,43 @@ function Write-JsonFile {
     [System.IO.File]::WriteAllText($Path, $json, $Utf8NoBom)
 }
 
+function Get-HookTitleForRun {
+    param([string]$RunDir)
+    $candidates = @()
+    $prep = Join-Path $RunDir 'prepared-video.txt'
+    if ([IO.File]::Exists($prep)) {
+        try {
+            $vp = [IO.File]::ReadAllText($prep, [Text.Encoding]::UTF8).Trim()
+            if ($vp) { $candidates += (Join-Path (Split-Path -Parent $vp) '剪辑记录.json') }
+        } catch { }
+    }
+    $egoIn = Join-Path $RunDir 'ego-input.json'
+    if ([IO.File]::Exists($egoIn)) {
+        try {
+            $inp = [System.IO.File]::ReadAllText($egoIn, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($inp.videoPath) { $candidates += (Join-Path (Split-Path -Parent ([string]$inp.videoPath)) '剪辑记录.json') }
+        } catch { }
+    }
+    foreach ($cand in $candidates) {
+        if ([IO.File]::Exists($cand)) {
+            try {
+                $rec = [System.IO.File]::ReadAllText($cand, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                if ($rec.hook_title) { return [string]$rec.hook_title }
+            } catch { }
+        }
+    }
+    return ''
+}
+
 # 流式运行 ego-browser，实时打印 stdout，最后返回 RESULT= 行
 function Invoke-EgoCollect {
+    param([string]$ScriptUrl)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'ego-browser'
-    $psi.Arguments = "nodejs -e `"await import('$CollectScriptUrl')`""
+    $psi.Arguments = ('nodejs -e "await import(''{0}'')"' -f $ScriptUrl)
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $Utf8NoBom
@@ -49,10 +79,11 @@ function Invoke-EgoCollect {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     [void]$proc.Start()
+    try { $proc.StandardInput.Close() } catch { }
 
     $errTask = $proc.StandardError.ReadToEndAsync()
     $stdout = New-Object System.Text.StringBuilder
-    $deadline = [DateTime]::UtcNow.AddMilliseconds(180000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds(240000)
     while ($true) {
         $remaining = [int](($deadline - [DateTime]::UtcNow).TotalMilliseconds)
         if ($remaining -le 0) { try { $proc.Kill() } catch { }; return 'RESULT=FAIL 执行超时' }
@@ -98,8 +129,10 @@ try {
             throw ("在 publish-runs 里没找到包含 '{0}' 的运行目录" -f $rawInput)
         } elseif ($matches.Count -gt 1) {
             $published = @($matches | Where-Object { [IO.File]::Exists((Join-Path $_.FullName 'retro.json')) })
-            if ($published.Count -ne 1) {
-                throw ("匹配到多个目录，请输入要复盘的完整目录名：" + (($published | ForEach-Object Name) -join '、'))
+            if ($published.Count -eq 0) {
+                throw ('匹配到多个目录，但均无 retro.json（未完成发布）：' + (($matches | ForEach-Object Name) -join '、'))
+            } elseif ($published.Count -gt 1) {
+                throw ('匹配到多个已发布目录，请输入要复盘的完整目录名：' + (($published | ForEach-Object Name) -join '、'))
             }
             $runDir = $published[0].FullName
         } else {
@@ -124,6 +157,7 @@ try {
         publishDesc      = [string]$retro.publishDesc
         publishTitle     = [string]$retro.publishTitle
         publishDate      = [string]$retro.publishDate
+        hookTitle        = Get-HookTitleForRun $runDir
         transcript       = $transcript
         metricsAtPublish = @($retro.metricsAtPublish | ForEach-Object { $_ })
     }
@@ -135,7 +169,7 @@ try {
     }
     $collectInput['capturedAt'] = [string]$retro.capturedAt
     $CollectInputPath = Join-Path $runDir ('collect-input-' + [guid]::NewGuid() + '.json')
-    $CollectScriptUrl += '?input=' + [Uri]::EscapeDataString($CollectInputPath)
+    $CollectScriptUrl = $CollectScriptBaseUri + '?input=' + [Uri]::EscapeDataString($CollectInputPath)
     Write-JsonFile -Path $CollectInputPath -Object $collectInput
 
     # ---- 3. 跑 ego 采集 --------------------------------------------
@@ -143,7 +177,7 @@ try {
         throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
     }
     Write-Host ('正在复盘：{0}' -f (Split-Path -Leaf $runDir)) -ForegroundColor Cyan
-    try { $result = Invoke-EgoCollect }
+    try { $result = Invoke-EgoCollect -ScriptUrl $CollectScriptUrl }
     finally { [IO.File]::Delete($CollectInputPath) }
 
     if ($result -match '^RESULT=OK') {

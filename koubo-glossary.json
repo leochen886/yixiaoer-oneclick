@@ -1,0 +1,31 @@
+{
+  "terms": [
+    "Claude",
+    "Anthropic",
+    "Gemini",
+    "ChatGPT",
+    "OpenAI",
+    "DeepSeek",
+    "GPT",
+    "AI",
+    "API",
+    "Cursor",
+    "Codex",
+    "GitHub",
+    "Linux",
+    "Windows",
+    "Mac",
+    "Pro",
+    "Agent"
+  ],
+  "aliases": {
+    "克劳德": "Claude",
+    "克劳泽": "Claude",
+    "Cloud": "Claude",
+    "杰米奶": "Gemini",
+    "杰姆莱": "Gemini",
+    "杰米奈": "Gemini",
+    "Sorpic": "Anthropic",
+    "安索皮克": "Anthropic"
+  }
+}

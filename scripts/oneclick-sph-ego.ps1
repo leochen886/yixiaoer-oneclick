@@ -42,8 +42,8 @@ $AsrScript = Join-Path $ScriptDir 'oneclick_asr.py'
 $EgoDir = Join-Path $ScriptDir 'ego'
 $EgoScriptPath = Join-Path $EgoDir 'publish-sph-ego.mjs'
 $LoginGatePath = Join-Path $EgoDir 'login-gate.mjs'
-$EgoScriptUrl = 'file:///' + ($EgoScriptPath -replace '\\', '/')
-$LoginGateUrl = 'file:///' + ($LoginGatePath -replace '\\', '/')
+$EgoScriptUrl = ([System.Uri]$EgoScriptPath).AbsoluteUri
+$LoginGateUrl = ([System.Uri]$LoginGatePath).AbsoluteUri
 
 $script:LogFile = $null
 $script:FormTitle = $null
@@ -165,6 +165,7 @@ function Invoke-Ego {
     $psi.Arguments = ConvertTo-ArgString @('nodejs', '-e', "await import('$ScriptUrl')")
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $Utf8NoBom
@@ -173,6 +174,7 @@ function Invoke-Ego {
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     [void]$proc.Start()
+    try { $proc.StandardInput.Close() } catch { }
 
     # stderr 异步读，避免其缓冲填满而阻塞 stdout 的实时读取
     $errTask = $proc.StandardError.ReadToEndAsync()
@@ -279,7 +281,9 @@ function Get-AiCopy {
     param(
         [string]$Transcript,
         [string]$VideoBase,
-        [string]$PromptPath
+        [string]$PromptPath,
+        [string]$HookTitle = '',
+        [string]$PlaybookPrompt = ''
     )
 
     $instructions = @'
@@ -294,10 +298,16 @@ function Get-AiCopy {
 - tags：3 到 5 个，每个 2 到 6 个汉字，不带 # 号
 - 全部使用简体中文；不要编造转写文本里没有的事实或数字
 
-转写文本：
 '@
 
-    $prompt = $instructions + $Transcript
+    $extra = ''
+    if ($HookTitle) {
+        $extra += ("画面顶部已固定的黄色大标题：{0}`n（请确保生成的短标题和这句大标题口径一致、互相呼应，不要矛盾）`n`n" -f $HookTitle)
+    }
+    if ($PlaybookPrompt) {
+        $extra += ("本账号历史复盘经验参考：`n{0}`n`n" -f $PlaybookPrompt)
+    }
+    $prompt = $instructions + $extra + "转写文本：`n" + $Transcript
     [System.IO.File]::WriteAllText($PromptPath, $prompt, $Utf8NoBom)
 
     $proc = Invoke-Process -FilePath 'claude' -Arguments @(
@@ -366,16 +376,14 @@ function Get-AiCopy {
 }
 
 function Get-FallbackCopy {
-    param([string]$Transcript, [string]$VideoBase)
+    param([string]$Transcript, [string]$VideoBase, [string]$HookTitle = '')
 
-    $title = $VideoBase
-    if ($Transcript) {
+    $title = if ($HookTitle) { $HookTitle.Trim() } else { $VideoBase }
+    if (-not $HookTitle -and $Transcript) {
         $first = ($Transcript -split '[。！？!?]')[0].Trim()
-        if ($first) {
-            if ($first.Length -gt 30) { $first = $first.Substring(0, 30) }
-            $title = $first
-        }
+        if ($first) { $title = $first }
     }
+    if ($title.Length -gt 16) { $title = $title.Substring(0, 16) }
     $desc = ''
     if ($Transcript) {
         if ($Transcript.Length -gt 200) { $desc = $Transcript.Substring(0, 200) } else { $desc = $Transcript }
@@ -392,23 +400,7 @@ try {
     Write-Host '  ----------------------------------------' -ForegroundColor DarkGray
     Write-Host ''
 
-    # ---- 0. 先检测登录态（一打开就检测：已登录直接过，未登录先扫码，登录成功后再传视频） ----
-    if (-not $PrepareOnly) {
-        if (-not (Get-Command 'ego-browser' -ErrorAction SilentlyContinue)) {
-            throw '找不到命令 ego-browser，请先确认它已安装并在 PATH 中'
-        }
-        if (-not (Test-Path -LiteralPath $LoginGatePath)) {
-            throw ('缺少登录门禁脚本：' + $LoginGatePath)
-        }
-        Write-Log '正在检测视频号登录态……' Cyan
-        $loginResult = Invoke-Ego -TimeoutMs 360000 -ScriptUrl $LoginGateUrl
-        Write-Log ("登录检测结果：{0}" -f $loginResult) DarkGray
-        if ($loginResult -notmatch '^RESULT=LOGIN_OK') {
-            throw ('登录未完成：{0}' -f $loginResult)
-        }
-    }
-
-    # ---- 1. 输入 ----------------------------------------------------
+    # ---- 1. 输入校验 ------------------------------------------------
     $rawInput = ''
     if ($InputArgs -and $InputArgs.Count -gt 0) {
         $rawInput = $InputArgs[0]
@@ -434,7 +426,7 @@ try {
     if (@('.mp4', '.mov', '.m4v') -notcontains $ext) { throw ("只支持 mp4 / mov 视频，当前文件是 {0}" -f $ext) }
 
     $requiredBins = @('ffmpeg', 'python')
-    if (-not $PrepareOnly) { $requiredBins += 'claude' }
+    if (-not $PrepareOnly) { $requiredBins += @('claude', 'ego-browser') }
     foreach ($bin in $requiredBins) {
         if (-not (Get-Command $bin -ErrorAction SilentlyContinue)) {
             throw ("找不到命令 {0}，请先确认它已安装并在 PATH 中" -f $bin)
@@ -442,6 +434,41 @@ try {
     }
     if (-not (Test-Path -LiteralPath $AsrScript)) { throw ("缺少转写脚本：{0}" -f $AsrScript) }
     if (-not (Test-Path -LiteralPath $EgoScriptPath)) { throw ('缺少 ego 自动化脚本：' + $EgoScriptPath) }
+    if (-not $PrepareOnly -and -not (Test-Path -LiteralPath $LoginGatePath)) {
+        throw ('缺少登录门禁脚本：' + $LoginGatePath)
+    }
+
+    # ---- 1.5 秒级前置查重（避免已发过的视频先白剪几分钟才被拦下） ----
+    if (-not $NoPublish -and -not $PrepareOnly) {
+        $inputDigest = Get-PathDigest $videoPath
+        $earlyClaimPath = Join-Path (Join-Path $RunRoot '.submissions') ($inputDigest.ToLowerInvariant() + '.json')
+        if ([IO.File]::Exists($earlyClaimPath)) {
+            $claimDir = ''
+            try {
+                $claimObj = [System.IO.File]::ReadAllText($earlyClaimPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                $claimDir = [string]$claimObj.runDir
+            } catch { }
+            if ($claimDir -and [IO.File]::Exists((Join-Path $claimDir 'submit-result.txt'))) {
+                $prevRes = [System.IO.File]::ReadAllText((Join-Path $claimDir 'submit-result.txt'), [System.Text.Encoding]::UTF8).Trim()
+                if ($prevRes -eq 'RESULT=OK') {
+                    Write-Host ('  同一作品此前已成功发表（记录：{0}），本次直接跳过，不再重复剪辑和上传。' -f $claimDir) -ForegroundColor Green
+                    exit 0
+                }
+            }
+            $claimLabel = if ($claimDir) { $claimDir } else { $earlyClaimPath }
+            throw ('该视频曾发起过发表但结果待核对（记录：{0}）。请先去视频号助手作品列表核实是否已发出，若确认未发出请移走对应 .submissions 记录后再重试。' -f $claimLabel)
+        }
+    }
+
+    # ---- 1.8 检测登录态（已登录直接过，未登录先扫码，登录成功后再剪片传视频） ----
+    if (-not $PrepareOnly) {
+        Write-Log '正在检测视频号登录态……' Cyan
+        $loginResult = Invoke-Ego -TimeoutMs 360000 -ScriptUrl $LoginGateUrl
+        Write-Log ("登录检测结果：{0}" -f $loginResult) DarkGray
+        if ($loginResult -notmatch '^RESULT=LOGIN_OK') {
+            throw ('登录未完成：{0}' -f $loginResult)
+        }
+    }
 
     # ---- 2. 运行目录 ------------------------------------------------
     $videoBase = [System.IO.Path]::GetFileNameWithoutExtension($videoPath)
@@ -474,7 +501,7 @@ try {
         try {
             # Windows PowerShell 5.1 also wraps native stderr progress in error records.
             $ErrorActionPreference = 'Continue'
-            & python -u -X utf8 (Join-Path $ScriptDir 'koubo.py') $videoPath --publish-path-file $pathFile 2>&1 |
+            & python -u -X utf8 (Join-Path $ScriptDir 'koubo.py') $videoPath --publish-path-file $pathFile --reuse-existing 2>&1 |
                 ForEach-Object {
                     $line = $_.ToString().TrimEnd()
                     if ($line.Trim()) {
@@ -544,19 +571,45 @@ try {
     $transcriptArchive = Join-Path $runDir 'transcript.txt'
     try { [System.IO.File]::WriteAllText($transcriptArchive, $transcript, $Utf8NoBom) } catch { }
 
-    # ---- 4. AI 文案 -------------------------------------------------
+    # ---- 4. AI 文案（结合顶部黄字 + 账号复盘经验小本本） --------------
+    $hookTitle = ''
+    $cutRecordPath = Join-Path (Split-Path -Parent $videoPath) '剪辑记录.json'
+    if ([IO.File]::Exists($cutRecordPath)) {
+        try {
+            $cutRecord = [System.IO.File]::ReadAllText($cutRecordPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($cutRecord.hook_title) { $hookTitle = [string]$cutRecord.hook_title }
+        } catch { }
+    }
+
+    $playbookPrompt = ''
+    $analyzeScript = Join-Path $ScriptDir 'retro_analyze.py'
+    if (-not $PrepareOnly -and [IO.File]::Exists($analyzeScript)) {
+        $prevPref = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $pbOut = (& python -X utf8 $analyzeScript --print-prompt copy --runs-dir $RunRoot 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $pbOut) {
+                $playbookPrompt = ($pbOut -join "`n").Trim()
+            }
+        } catch {
+            $playbookPrompt = ''
+        } finally {
+            $ErrorActionPreference = $prevPref
+        }
+    }
+
     $copy = $null
     if (-not $PrepareOnly -and $transcript.Length -ge 10) {
         Write-Log 'AI 生成标题、描述、标签……' Cyan
         try {
-            $copy = Get-AiCopy -Transcript $transcript -VideoBase $videoBase -PromptPath (Join-Path $runDir 'prompt.txt')
+            $copy = Get-AiCopy -Transcript $transcript -VideoBase $videoBase -PromptPath (Join-Path $runDir 'prompt.txt') -HookTitle $hookTitle -PlaybookPrompt $playbookPrompt
             Write-Log 'AI 文案已生成' DarkGray
         } catch {
             Write-Log ('AI 文案失败，改用转写内容兜底：{0}' -f $_.Exception.Message) Yellow
         }
     }
     if (-not $copy -or -not $copy.Title) {
-        $copy = Get-FallbackCopy -Transcript $transcript -VideoBase $videoBase
+        $copy = Get-FallbackCopy -Transcript $transcript -VideoBase $videoBase -HookTitle $hookTitle
     }
 
     if (-not $copy.Description) { $copy.Description = '' }
@@ -597,14 +650,40 @@ try {
     if ([IO.File]::Exists($submitReceipt)) {
         $egoResult = [IO.File]::ReadAllText($submitReceipt).Trim()
     } elseif ($egoResult -match '^RESULT=FAIL') {
-        $claim = Join-Path (Join-Path $RunRoot '.submissions') ($publishKey.ToLowerInvariant() + '.json')
-        if ([IO.File]::Exists($claim)) {
-            $egoResult = 'RESULT=UNCONFIRMED 发布回执中断，已保留提交记录。'
+        $subDir = Join-Path $RunRoot '.submissions'
+        foreach ($candKey in @($publishKey, $videoHash)) {
+            if (-not $candKey) { continue }
+            $claimPath = Join-Path $subDir ($candKey.ToLowerInvariant() + '.json')
+            if ([IO.File]::Exists($claimPath)) {
+                try {
+                    $claimObj = [System.IO.File]::ReadAllText($claimPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                    if ($claimObj.runDir -eq $runDir) {
+                        $egoResult = 'RESULT=UNCONFIRMED 发布回执中断，已保留提交记录。'
+                        break
+                    }
+                } catch { }
+            }
         }
     }
     if ($null -ne $script:FormTitle) { $copy.Title = $script:FormTitle }
     [System.IO.File]::WriteAllText((Join-Path $runDir 'ego-result.txt'), $egoResult, $Utf8NoBom)
     Write-Log ('ego 结果：{0}' -f $egoResult) DarkGray
+
+    if ($egoResult -match '^RESULT=OK') {
+        $historyScript = Join-Path $ScriptDir 'history_db.py'
+        if ([IO.File]::Exists($historyScript)) {
+            try {
+                $prevPrefHist = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                & python -X utf8 $historyScript sync-runs --runs-dir $RunRoot --history-dir (Join-Path $Root 'history') 2>$null | Out-Null
+                Write-Log '已同步本次作品与最新首屏数据到 history/ 数据库' DarkGray
+            } catch {
+                Write-Log ('history 同步跳过：{0}' -f $_.Exception.Message) Yellow
+            } finally {
+                $ErrorActionPreference = $prevPrefHist
+            }
+        }
+    }
 
     # ---- 7. 总结 ---------------------------------------------------
     Write-Host ''
